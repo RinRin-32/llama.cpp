@@ -1807,53 +1807,63 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
-    // select one of the 2 inputs, based on the batch contents
-    // ref: https://github.com/ggml-org/llama.cpp/pull/18550
-    std::array<ggml_tensor *, 2> inps;
+    ggml_tensor * cur;
 
-    // token embeddings path (ubatch.token != nullptr)
-    {
-        auto & cur = inps[0];
+    if (!tok_embd) {
+        // No token embedding table (e.g. the qwen3-tts code predictor): only the
+        // precomputed embd input is ever fed. Use it directly and skip the dual-path
+        // select - feeding both select branches the same tensor (inp->embd) aliases
+        // them, which the CPU backend mishandles (produces NaN).
+        cur = inp->embd;
+    } else {
+        // select one of the 2 inputs, based on the batch contents
+        // ref: https://github.com/ggml-org/llama.cpp/pull/18550
+        std::array<ggml_tensor *, 2> inps;
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        // token embeddings path (ubatch.token != nullptr)
+        {
+            auto & curt = inps[0];
 
-        // apply lora for embedding tokens if needed
-        for (const auto & lora : *loras) {
-            llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
-            if (lw == nullptr) {
-                continue;
+            curt = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+
+            // apply lora for embedding tokens if needed
+            for (const auto & lora : *loras) {
+                llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
+                if (lw == nullptr) {
+                    continue;
+                }
+
+                const float adapter_scale = lora.second;
+                const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+
+                ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
+                            ctx0, lw->b, // non-transposed lora_b
+                            ggml_get_rows(ctx0, lw->a, inp->tokens)
+                            ), scale);
+
+                curt = ggml_add(ctx0, curt, inpL_delta);
             }
 
-            const float adapter_scale = lora.second;
-            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
-
-            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
-                        ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, inp->tokens)
-                        ), scale);
-
-            cur = ggml_add(ctx0, cur, inpL_delta);
+            if (n_embd_inp != n_embd) {
+                curt = ggml_pad(ctx0, curt, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            }
         }
+
+        // vector embeddings path (ubatch.embd != nullptr)
+        {
+            auto & curt = inps[1];
+
+            curt = inp->embd;
+        }
+
+        assert(ggml_are_same_shape (inps[0], inps[1]));
+        assert(ggml_are_same_stride(inps[0], inps[1]));
+
+        cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
 
         if (n_embd_inp != n_embd) {
-            cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
         }
-    }
-
-    // vector embeddings path (ubatch.embd != nullptr)
-    {
-        auto & cur = inps[1];
-
-        cur = inp->embd;
-    }
-
-    assert(ggml_are_same_shape (inps[0], inps[1]));
-    assert(ggml_are_same_stride(inps[0], inps[1]));
-
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
-
-    if (n_embd_inp != n_embd) {
-        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
     }
 
     res->t_inp_embd = cur;

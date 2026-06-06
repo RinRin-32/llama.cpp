@@ -107,6 +107,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3vl(params);
         case LLM_ARCH_QWEN3VLMOE:
             return new llama_model_qwen3vlmoe(params);
+        case LLM_ARCH_QWEN3TTS:
+            return new llama_model_qwen3tts(params);
+        case LLM_ARCH_QWEN3TTS_CP:
+            return new llama_model_qwen3tts_cp(params);
         case LLM_ARCH_PHI2:
             return new llama_model_phi2(params);
         case LLM_ARCH_PHI3:
@@ -2438,6 +2442,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_QWEN3TTS_CP:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -2447,6 +2452,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN3TTS:
             return LLAMA_ROPE_TYPE_IMROPE;
 
         case LLM_ARCH_GLM4:

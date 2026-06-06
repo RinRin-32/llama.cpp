@@ -154,6 +154,10 @@ class Keys:
         HIDDEN_ACT                        = "{arch}.hidden_activation"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
+        TTS_TEXT_VOCAB_SIZE               = "{arch}.tts.text_vocab_size"
+        TTS_TEXT_EMBEDDING_LENGTH         = "{arch}.tts.text_embedding_length"
+        TTS_NUM_CODE_GROUPS               = "{arch}.tts.num_code_groups"
+        TTS_POSITION_ID_PER_SECONDS       = "{arch}.tts.position_id_per_seconds"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -518,6 +522,8 @@ class MODEL_ARCH(IntEnum):
     KIMI_LINEAR      = auto()
     TALKIE           = auto()
     MELLUM           = auto()
+    QWEN3TTS         = auto()
+    QWEN3TTS_CP      = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -913,6 +919,16 @@ class MODEL_TENSOR(IntEnum):
     A_ENC_CONV_NORM        = auto() # SSM conv
     A_ENC_CONV_PW1         = auto()
     A_ENC_CONV_PW2         = auto()
+    # qwen3 tts
+    TTS_TEXT_EMBD          = auto()
+    TTS_TEXT_PROJ_UP       = auto()
+    TTS_TEXT_PROJ_GATE     = auto()
+    TTS_TEXT_PROJ_DOWN     = auto()
+    TTS_CODEC_EMBD         = auto()
+    TTS_CODEC_HEAD         = auto()
+    TTS_CP_CODEC_EMBD      = auto()
+    TTS_CP_LM_HEAD         = auto()
+    TTS_CP_SMALL_TO_MTP    = auto()
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
@@ -1065,6 +1081,8 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
+    MODEL_ARCH.QWEN3TTS:         "qwen3tts",
+    MODEL_ARCH.QWEN3TTS_CP:      "qwen3tts-cp",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1477,6 +1495,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    MODEL_TENSOR.TTS_TEXT_EMBD:             "tts.text_embd",
+    MODEL_TENSOR.TTS_TEXT_PROJ_UP:          "tts.text_proj_up",
+    MODEL_TENSOR.TTS_TEXT_PROJ_GATE:        "tts.text_proj_gate",
+    MODEL_TENSOR.TTS_TEXT_PROJ_DOWN:        "tts.text_proj_down",
+    MODEL_TENSOR.TTS_CODEC_EMBD:            "tts.codec_embd",
+    MODEL_TENSOR.TTS_CODEC_HEAD:            "tts.codec_head",
+    MODEL_TENSOR.TTS_CP_CODEC_EMBD:         "tts.cp.codec_embd.{xid}",
+    MODEL_TENSOR.TTS_CP_LM_HEAD:            "tts.cp.lm_head.{xid}",
+    MODEL_TENSOR.TTS_CP_SMALL_TO_MTP:       "tts.cp.small_to_mtp",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -4192,6 +4219,45 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
+    ],
+    MODEL_ARCH.QWEN3TTS: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.TTS_TEXT_EMBD,
+        MODEL_TENSOR.TTS_TEXT_PROJ_UP,
+        MODEL_TENSOR.TTS_TEXT_PROJ_GATE,
+        MODEL_TENSOR.TTS_TEXT_PROJ_DOWN,
+        MODEL_TENSOR.TTS_CODEC_EMBD,
+        MODEL_TENSOR.TTS_CODEC_HEAD,
+    ],
+    MODEL_ARCH.QWEN3TTS_CP: [
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.TTS_CP_CODEC_EMBD,
+        MODEL_TENSOR.TTS_CP_LM_HEAD,
+        MODEL_TENSOR.TTS_CP_SMALL_TO_MTP,
     ],
     # TODO
 }
