@@ -1211,6 +1211,14 @@ struct voc_model {
 static ggml_tensor * voc_ensure_f16(ggml_context * ctx, ggml_tensor * w) {
     return (w->type != GGML_TYPE_F16) ? ggml_cast(ctx, w, GGML_TYPE_F16) : w;
 }
+// CUDA conv_transpose_1d requires F32 weights+input; cast for the GPU vocoder path.
+static ggml_tensor * voc_ensure_f32(ggml_context * ctx, ggml_tensor * w) {
+    return (w->type != GGML_TYPE_F32) ? ggml_cast(ctx, w, GGML_TYPE_F32) : w;
+}
+// On the GPU path, conv_transpose weights must be F32 (CUDA); elsewhere F16 (CPU im2col path).
+static ggml_tensor * voc_conv_t_w(ggml_context * ctx, ggml_tensor * w, bool gpu_path) {
+    return gpu_path ? voc_ensure_f32(ctx, w) : voc_ensure_f16(ctx, w);
+}
 
 static ggml_tensor * voc_snake(ggml_context * ctx, ggml_tensor * x,
                                 ggml_tensor * alpha, ggml_tensor * beta) {
@@ -1307,7 +1315,7 @@ static ggml_tensor * voc_residual_fwd(ggml_context * ctx, ggml_tensor * x,
 }
 
 static ggml_tensor * voc_decoder_block_fwd(ggml_context * ctx, ggml_tensor * x,
-                                             const voc_decoder_block & blk, int upsample_rate) {
+                                             const voc_decoder_block & blk, int upsample_rate, bool gpu_path) {
     if (blk.snake_alpha) x = voc_snake(ctx, x, blk.snake_alpha, blk.snake_beta);
 
     int64_t T_in = x->ne[0], ch_in = x->ne[1];
@@ -1315,7 +1323,7 @@ static ggml_tensor * voc_decoder_block_fwd(ggml_context * ctx, ggml_tensor * x,
     int kernel = (int)blk.conv_t_w->ne[0];
 
     ggml_tensor * x2d = ggml_reshape_2d(ctx, x, T_in, ch_in);
-    x2d = ggml_conv_transpose_1d(ctx, voc_ensure_f16(ctx, blk.conv_t_w), x2d, upsample_rate, 0, 1);
+    x2d = ggml_conv_transpose_1d(ctx, voc_conv_t_w(ctx, blk.conv_t_w, gpu_path), x2d, upsample_rate, 0, 1);
 
     int64_t T_new = x2d->ne[0];
     x = ggml_reshape_3d(ctx, x2d, T_new, ch_out, 1);
@@ -1336,11 +1344,11 @@ static ggml_tensor * voc_decoder_block_fwd(ggml_context * ctx, ggml_tensor * x,
 }
 
 static ggml_tensor * voc_upsample_fwd(ggml_context * ctx, ggml_tensor * x,
-                                        const voc_upsample_block & blk) {
+                                        const voc_upsample_block & blk, bool gpu_path) {
     int64_t T = x->ne[0], C = x->ne[1];
 
     ggml_tensor * x2d = ggml_reshape_2d(ctx, x, T, C);
-    x2d = ggml_conv_transpose_1d(ctx, voc_ensure_f16(ctx, blk.conv_w), x2d, 2, 0, 1);
+    x2d = ggml_conv_transpose_1d(ctx, voc_conv_t_w(ctx, blk.conv_w, gpu_path), x2d, 2, 0, 1);
     int64_t T_new = x2d->ne[0];
     x = ggml_reshape_3d(ctx, x2d, T_new, C, 1);
     if (blk.conv_b) x = ggml_add(ctx, x, ggml_reshape_3d(ctx, blk.conv_b, 1, C, 1));
@@ -1377,7 +1385,8 @@ static ggml_tensor * voc_upsample_fwd(ggml_context * ctx, ggml_tensor * x,
     return ggml_add(ctx, res, x);
 }
 
-static bool voc_load_weights(gguf_tensor_loader & loader, voc_model & voc) {
+template<class Loader>
+static bool voc_load_weights(Loader & loader, voc_model & voc) {
     auto get = [&](const char * name) -> ggml_tensor * {
         ggml_tensor * t = loader.get(name);
         if (!t) fprintf(stderr, "WARN: missing vocoder tensor: %s\n", name);
@@ -1471,7 +1480,8 @@ static bool voc_load_weights(gguf_tensor_loader & loader, voc_model & voc) {
 }
 
 static ggml_cgraph * voc_build_graph(ggml_context * ctx0, const voc_model & voc,
-                                      const std::vector<std::vector<int32_t>> & all_codes) {
+                                      const std::vector<std::vector<int32_t>> & all_codes,
+                                      bool gpu_path = false) {
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, VOC_MAX_NODES, false);
     const int n_frames = (int)all_codes.size();
     if (n_frames == 0) return gf;
@@ -1546,8 +1556,8 @@ static ggml_cgraph * voc_build_graph(ggml_context * ctx0, const voc_model & voc,
 
     // No residual from pre-conv (HF does NOT add a skip connection here)
     // 4. Upsample (2 ConvNeXt blocks, each ×2)
-    cur = voc_upsample_fwd(ctx0, cur, voc.upsample[0]);
-    cur = voc_upsample_fwd(ctx0, cur, voc.upsample[1]);
+    cur = voc_upsample_fwd(ctx0, cur, voc.upsample[0], gpu_path);
+    cur = voc_upsample_fwd(ctx0, cur, voc.upsample[1], gpu_path);
 
     // 5. Decoder: dec0 is CausalConvNet(latent_dim, decoder_dim, kernel=7)
     //    causal padding = kernel_size - stride = 7 - 1 = 6 on the LEFT
@@ -1557,7 +1567,7 @@ static ggml_cgraph * voc_build_graph(ggml_context * ctx0, const voc_model & voc,
 
     const int upsample_rates[4] = {8, 5, 4, 3};
     for (int i = 0; i < 4; i++)
-        cur = voc_decoder_block_fwd(ctx0, cur, voc.dec_blocks[i], upsample_rates[i]);
+        cur = voc_decoder_block_fwd(ctx0, cur, voc.dec_blocks[i], upsample_rates[i], gpu_path);
 
     // dec5 = SnakeBeta, dec6 = CausalConvNet(output_dim, 1, kernel=7)
     cur = voc_snake(ctx0, cur, voc.dec5_snake_alpha, voc.dec5_snake_beta);
@@ -1650,6 +1660,100 @@ static std::vector<float> voc_decode_audio(const voc_model & voc,
                                            int n_frames) {
     return voc_decode_audio_range(voc, all_codes, 0, n_frames);
 }
+
+// ─── GPU vocoder ──────────────────────────────────────────────────────────────
+// The conv vocoder is the dominant cost at finalize (~1.4s/clip on CPU). Mirror its
+// weights into a GPU buffer once and run the decode graph through a [GPU, CPU] sched
+// (any op CUDA can't take falls back to CPU automatically; conv_transpose_1d uses F32
+// weights so it stays on the GPU). One mutex-guarded engine: GPU decode is ~10x faster
+// than CPU, so a single instance keeps up with generation without per-thread weight copies.
+
+// A GPU-resident clone of all vocoder weights (same names/shapes), usable as a
+// voc_load_weights "loader" (provides .get and a .tensors map).
+struct gpu_weight_set {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::map<std::string, ggml_tensor *> tensors;
+    ~gpu_weight_set() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); }
+    ggml_tensor * get(const char * name) const { auto it = tensors.find(name); return it!=tensors.end()?it->second:nullptr; }
+};
+
+static bool voc_mirror_to_gpu(gguf_tensor_loader & cpu_loader, ggml_backend_t be, gpu_weight_set & gw) {
+    gw.ctx = ggml_init({ (cpu_loader.tensors.size()+1)*ggml_tensor_overhead(), nullptr, true });
+    for (auto & kv : cpu_loader.tensors) {
+        ggml_tensor * s = kv.second;
+        ggml_tensor * d = ggml_new_tensor(gw.ctx, s->type, GGML_MAX_DIMS, s->ne);
+        ggml_set_name(d, kv.first.c_str());
+        gw.tensors[kv.first] = d;
+    }
+    gw.buf = ggml_backend_alloc_ctx_tensors(gw.ctx, be);
+    if (!gw.buf) return false;
+    for (auto & kv : cpu_loader.tensors) ggml_backend_tensor_set(gw.tensors[kv.first], kv.second->data, 0, ggml_nbytes(kv.second));
+    return true;
+}
+
+struct gpu_vocoder {
+    ggml_backend_t gpu = nullptr, cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    gpu_weight_set gw;
+    voc_model vocg;
+    std::mutex mu;
+    bool ok = false;
+
+    bool init(gguf_tensor_loader & cpu_loader) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) return false;
+        gpu = ggml_backend_dev_init(dev, nullptr);
+        if (!gpu) return false;
+        cpu = ggml_backend_cpu_init();
+        if (!voc_mirror_to_gpu(cpu_loader, gpu, gw)) return false;
+        if (!voc_load_weights(gw, vocg)) return false;
+        ggml_backend_t backs[2] = { gpu, cpu };
+        sched = ggml_backend_sched_new(backs, nullptr, 2, VOC_MAX_NODES, false, true);
+        if (!sched) return false;
+        ok = true;
+        return true;
+    }
+    ~gpu_vocoder() { if (sched) ggml_backend_sched_free(sched); if (cpu) ggml_backend_free(cpu); if (gpu) ggml_backend_free(gpu); }
+
+    std::vector<float> decode(const std::vector<std::vector<int32_t>> & all, int start, int end) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<float> audio;
+        int n_frames = end - start;
+        if (n_frames <= 0) return audio;
+        std::vector<std::vector<int32_t>> slice(all.begin()+start, all.begin()+end);
+
+        size_t cs = ggml_tensor_overhead()*VOC_MAX_NODES + 32*1024*1024;
+        ggml_context * c = ggml_init({ cs, nullptr, true });
+        ggml_cgraph * gf = voc_build_graph(c, vocg, slice, /*gpu_path=*/true);
+
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) { ggml_free(c); return audio; }
+
+        std::vector<int32_t> ids(n_frames);
+        ggml_tensor * cb0_in = ggml_graph_get_tensor(gf, "cb0_ids");
+        for (int f=0; f<n_frames; f++) ids[f] = slice[f][0];
+        ggml_backend_tensor_set(cb0_in, ids.data(), 0, n_frames*sizeof(int32_t));
+        char nm[64];
+        for (int cci=0; cci<15; cci++) {
+            snprintf(nm, sizeof(nm), "cb_rest_ids_%d", cci);
+            ggml_tensor * t = ggml_graph_get_tensor(gf, nm);
+            if (t) { for (int f=0; f<n_frames; f++) ids[f] = slice[f][cci+1]; ggml_backend_tensor_set(t, ids.data(), 0, n_frames*sizeof(int32_t)); }
+        }
+        ggml_tensor * pos_in = ggml_graph_get_tensor(gf, "voc_pos");
+        for (int f=0; f<n_frames; f++) ids[f] = f;
+        ggml_backend_tensor_set(pos_in, ids.data(), 0, n_frames*sizeof(int32_t));
+
+        ggml_backend_sched_graph_compute(sched, gf);
+
+        ggml_tensor * ao = ggml_graph_get_tensor(gf, "audio");
+        int ns = (int)ggml_nelements(ao);
+        audio.resize(ns);
+        ggml_backend_tensor_get(ao, audio.data(), 0, ns*sizeof(float));
+        ggml_free(c);
+        return audio;
+    }
+};
 
 // Dequantize a (bf16/f16/f32) tensor's full contents to an f32 buffer, preserving layout.
 static void dequant_to_f32(const ggml_tensor * t, float * out) {
@@ -3047,7 +3151,20 @@ int main(int argc, char ** argv) {
             struct voc_job { std::shared_ptr<req_t> req; std::vector<std::vector<int32_t>> codes; int icl_ref; };
             std::deque<std::shared_ptr<voc_job>> vq; std::mutex vqm; std::condition_variable vqcv;
             const int SPF_VOC = 1920;
-            int n_voc_workers = 6;
+            // Optional GPU vocoder (QWEN_VOC_GPU=1): one mutex-guarded engine the workers share.
+            std::unique_ptr<gpu_vocoder> gpu_voc;
+            if (voc_ready && getenv("QWEN_VOC_GPU")) {
+                gpu_voc = std::make_unique<gpu_vocoder>();
+                if (gpu_voc->init(voc_loader)) {
+                    printf("[serve] vocoder backend: GPU (sched gpu+cpu)\n");
+                    fprintf(stderr, "[serve] WARNING: QWEN_VOC_GPU is EXPERIMENTAL and UNSAFE under concurrent load.\n"
+                                    "        The GPU vocode worker threads submit CUDA work concurrently with the\n"
+                                    "        generation threads on the same device; ggml's CUDA backend is not\n"
+                                    "        multi-thread-safe and the device can wedge. Use only at concurrency 1,\n"
+                                    "        or prefer the default CPU vocode pool.\n");
+                } else { gpu_voc.reset(); printf("[serve] vocoder backend: GPU init failed -> CPU pool\n"); }
+            }
+            int n_voc_workers = gpu_voc ? 3 : 6; // GPU decode is mutex-serialized; a few workers pipeline the CPU-side trim
             if (const char* e=getenv("QWEN_VOC_WORKERS")) n_voc_workers = std::max(1, atoi(e));
             if (!getenv("QWEN_VOC_THREADS")) {
                 unsigned hw = std::thread::hardware_concurrency(); if (!hw) hw = 8;
@@ -3064,7 +3181,10 @@ int main(int argc, char ** argv) {
                       if (!vq.empty()) { j = vq.front(); vq.pop_front(); } }
                     if (!j) continue;
                     std::vector<float> pcm;
-                    if (voc_ready && !j->codes.empty()) pcm = voc_decode_audio(voc, j->codes, (int)j->codes.size());
+                    if (voc_ready && !j->codes.empty()) {
+                        if (gpu_voc) pcm = gpu_voc->decode(j->codes, 0, (int)j->codes.size());
+                        else         pcm = voc_decode_audio(voc, j->codes, (int)j->codes.size());
+                    }
                     int trim = j->icl_ref * SPF_VOC; // trim the regenerated ICL reference prefix
                     if (trim > 0 && trim < (int)pcm.size()) {
                         int cut = find_zero_crossing(pcm, trim);
