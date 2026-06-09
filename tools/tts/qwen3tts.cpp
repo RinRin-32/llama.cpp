@@ -1765,6 +1765,114 @@ struct gpu_vocoder {
     }
 };
 
+// ─── GPU code predictor ───────────────────────────────────────────────────────
+// The CP loop (15 autoregressive single-token decodes/frame via llama) is dispatch-bound:
+// ~16 host<->device sync round-trips/frame (one per step) blocking ~68% of the scheduler loop,
+// because each step's hidden must be read to the host to sample before the next step. This
+// reimplements the CP forward (Qwen3 decoder: RMSNorm, GQA 16/8 head_dim 128, q/k-norm, NEOX
+// RoPE theta 1e6, SwiGLU, 5 layers) as one custom ggml graph on a persistent GPU backend, so the
+// whole frame (prefill + 15 steps, with on-GPU sampling + embedding lookup) runs with ONE sync.
+struct cp_gpu {
+    ggml_backend_t be = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    gpu_weight_set gw;
+    bool ok = false;
+    // hparams
+    int n_layer=5, n_embd=1024, n_head=16, n_head_kv=8, head_dim=128, n_ff=3072, vocab=2048, n_embd_talker=2048;
+    float rms_eps=1e-6f, rope_theta=1e6f;
+    // weights (GPU)
+    struct lw { ggml_tensor *attn_norm,*wq,*wk,*wv,*wo,*q_norm,*k_norm,*ffn_norm,*ffn_gate,*ffn_up,*ffn_down; };
+    std::vector<lw> L;
+    ggml_tensor *out_norm=nullptr, *s2m_w=nullptr, *s2m_b=nullptr;
+    std::vector<ggml_tensor*> codec_embd, lm_head; // [15] each
+
+    bool init(const char * cp_path) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) return false;
+        be = ggml_backend_dev_init(dev, nullptr);
+        if (!be) return false;
+        gguf_tensor_loader ld;
+        if (!ld.load(cp_path, "")) return false;            // all tensors (blk.*, output_norm, tts.cp.*)
+        if (!voc_mirror_to_gpu(ld, be, gw)) return false;   // reuse the generic GPU mirror
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        auto g=[&](const std::string&n){ return gw.get(n.c_str()); };
+        out_norm = g("output_norm.weight");
+        s2m_w = g("tts.cp.small_to_mtp.weight"); s2m_b = g("tts.cp.small_to_mtp.bias");
+        L.resize(n_layer);
+        for (int i=0;i<n_layer;i++){ char b[64]; auto B=[&](const char*s){ snprintf(b,sizeof(b),"blk.%d.%s",i,s); return g(b); };
+            L[i].attn_norm=B("attn_norm.weight"); L[i].wq=B("attn_q.weight"); L[i].wk=B("attn_k.weight");
+            L[i].wv=B("attn_v.weight"); L[i].wo=B("attn_output.weight"); L[i].q_norm=B("attn_q_norm.weight");
+            L[i].k_norm=B("attn_k_norm.weight"); L[i].ffn_norm=B("ffn_norm.weight"); L[i].ffn_gate=B("ffn_gate.weight");
+            L[i].ffn_up=B("ffn_up.weight"); L[i].ffn_down=B("ffn_down.weight"); }
+        codec_embd.resize(15); lm_head.resize(15);
+        for (int c=0;c<15;c++){ char b[64];
+            snprintf(b,sizeof(b),"tts.cp.codec_embd.%d.weight",c); codec_embd[c]=g(b);
+            snprintf(b,sizeof(b),"tts.cp.lm_head.%d.weight",c); lm_head[c]=g(b); }
+        if (!out_norm||!s2m_w||!L[0].wq||!codec_embd[0]||!lm_head[0]) return false;
+        n_embd_talker = (int)codec_embd[0]->ne[0]; // 2048
+        ok = true; return true;
+    }
+    ~cp_gpu(){ if(alloc) ggml_gallocr_free(alloc); if(be) ggml_backend_free(be); }
+
+    // RMSNorm over dim0.
+    ggml_tensor* rn(ggml_context*c, ggml_tensor*x, ggml_tensor*w){ return ggml_mul(c, ggml_rms_norm(c,x,rms_eps), w); }
+
+    // One decoder layer over T positions. x:[n_embd,T], pos:[T] (i32). Causal self-attention.
+    ggml_tensor* layer(ggml_context*c, const lw&l, ggml_tensor*x, ggml_tensor*pos, int T){
+        ggml_tensor* res=x;
+        ggml_tensor* n=rn(c,x,l.attn_norm);
+        ggml_tensor* Q=ggml_mul_mat(c,l.wq,n);  // [n_head*head_dim, T]
+        ggml_tensor* K=ggml_mul_mat(c,l.wk,n);  // [n_head_kv*head_dim, T]
+        ggml_tensor* V=ggml_mul_mat(c,l.wv,n);
+        Q=ggml_reshape_3d(c,Q,head_dim,n_head,T);
+        K=ggml_reshape_3d(c,K,head_dim,n_head_kv,T);
+        V=ggml_reshape_3d(c,V,head_dim,n_head_kv,T);
+        Q=rn(c,Q,l.q_norm); K=rn(c,K,l.k_norm);                    // per-head RMSNorm over head_dim
+        Q=ggml_rope_ext(c,Q,pos,nullptr,head_dim,GGML_ROPE_TYPE_NEOX,0,rope_theta,1.f,0.f,1.f,0.f,0.f);
+        K=ggml_rope_ext(c,K,pos,nullptr,head_dim,GGML_ROPE_TYPE_NEOX,0,rope_theta,1.f,0.f,1.f,0.f,0.f);
+        Q=ggml_permute(c,Q,0,2,1,3);                                // [head_dim, T, n_head]
+        K=ggml_permute(c,K,0,2,1,3);                                // [head_dim, T, n_head_kv]
+        ggml_tensor* KQ=ggml_mul_mat(c,K,Q);                        // GQA broadcast -> [T(k), T(q), n_head]
+        KQ=ggml_scale(c,KQ,1.f/sqrtf((float)head_dim));
+        KQ=ggml_diag_mask_inf(c,KQ,0);
+        KQ=ggml_soft_max(c,KQ);
+        ggml_tensor* Vt=ggml_cont(c,ggml_permute(c,V,1,2,0,3));     // [T, head_dim, n_head_kv]
+        ggml_tensor* O=ggml_mul_mat(c,Vt,KQ);                       // -> [head_dim, T(q), n_head]
+        O=ggml_permute(c,O,0,2,1,3);                                // [head_dim, n_head, T]
+        O=ggml_cont_2d(c,O,head_dim*n_head,T);
+        O=ggml_mul_mat(c,l.wo,O);                                   // [n_embd, T]
+        x=ggml_add(c,res,O); res=x;
+        n=rn(c,x,l.ffn_norm);
+        ggml_tensor* g=ggml_silu(c,ggml_mul_mat(c,l.ffn_gate,n));
+        ggml_tensor* u=ggml_mul_mat(c,l.ffn_up,n);
+        ggml_tensor* f=ggml_mul_mat(c,l.ffn_down,ggml_mul(c,g,u));
+        return ggml_add(c,res,f);
+    }
+    // Forward over T positions -> final-norm hidden [n_embd, T].
+    ggml_tensor* forward(ggml_context*c, ggml_tensor*x, ggml_tensor*pos, int T){
+        for (int i=0;i<n_layer;i++) x=layer(c,L[i],x,pos,T);
+        return rn(c,x,out_norm);
+    }
+
+    // Validation helper: given T already-projected input embeddings (n_embd-major: in[t*n_embd+..])
+    // at positions pos[t], run the forward and copy the final hidden for every position to host.
+    // Lets the caller apply the existing host lm_head + sampler so only the transformer differs.
+    void compute_hidden(const float* in, const int32_t* pos, int T, std::vector<float>& hid){
+        ggml_context* c = ggml_init({ ggml_tensor_overhead()*4096 + ggml_graph_overhead() + 8*1024*1024, nullptr, true });
+        ggml_tensor* X = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_embd, T);
+        ggml_tensor* P = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
+        ggml_tensor* H = forward(c, X, P, T);
+        ggml_cgraph* gf = ggml_new_graph(c); ggml_build_forward_expand(gf, H);
+        ggml_gallocr_alloc_graph(alloc, gf);
+        ggml_backend_tensor_set(X, in, 0, (size_t)n_embd*T*sizeof(float));
+        ggml_backend_tensor_set(P, pos, 0, (size_t)T*sizeof(int32_t));
+        ggml_backend_graph_compute(be, gf);
+        hid.resize((size_t)n_embd*T);
+        ggml_backend_tensor_get(H, hid.data(), 0, hid.size()*sizeof(float));
+        ggml_free(c);
+    }
+};
+
 // Dequantize a (bf16/f16/f32) tensor's full contents to an f32 buffer, preserving layout.
 static void dequant_to_f32(const ggml_tensor * t, float * out) {
     int64_t n = ggml_nelements(t);
@@ -2068,6 +2176,7 @@ int main(int argc, char ** argv) {
                        // produces NaN on the CPU backend (ggml CPU-backend issue in the CP graph),
                        // so keep it on GPU until that is fixed.
     bool streaming_text = false;
+    bool validate_cp_gpu = false; // compare the custom GPU CP forward vs llama's CP per frame
 
     tts_sampler_params talker_sparams;
     tts_sampler_params cp_sparams;
@@ -2097,6 +2206,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
         else if (strcmp(argv[i], "--n-gpu-layers") == 0 && i + 1 < argc) n_gpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cp-n-gpu-layers") == 0 && i + 1 < argc) cp_n_gpu = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--validate-cp-gpu") == 0) validate_cp_gpu = true;
         else if (strcmp(argv[i], "--stream-chunk") == 0 && i + 1 < argc) stream_chunk = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stream-chunk-initial") == 0 && i + 1 < argc) stream_chunk_initial = atoi(argv[++i]);
         else if (strcmp(argv[i], "--dump-intermediates") == 0 && i + 1 < argc) dump_dir = argv[++i];
@@ -3683,6 +3793,13 @@ int main(int argc, char ** argv) {
         double ttfb_ms        = 0.0;
         const bool streaming  = stream_chunk > 0 && voc_ready;
 
+        // Optional custom GPU code-predictor validation (compare its forward to llama per frame).
+        cp_gpu cpg; long vg_total = 0, vg_match = 0;
+        if (validate_cp_gpu) {
+            if (cpg.init(cp_path.c_str())) printf("[validate-cp-gpu] GPU CP engine ready (run with --greedy for a deterministic compare)\n");
+            else fprintf(stderr, "[validate-cp-gpu] GPU CP engine init failed\n");
+        }
+
         for (int frame = 0; frame < max_tokens; frame++) {
             if (cb0_token == (int)codec_eos_id) {
                 printf("  EOS detected at frame %d\n", frame);
@@ -3702,6 +3819,10 @@ int main(int argc, char ** argv) {
             // Prefill CP with 2 embeddings: [talker_hidden, cb0_embd], each projected into CP space.
             std::vector<float> talker_h = project_cp(std::vector<float>(hidden, hidden + n_embd));
             std::vector<float> cb0_emb  = project_cp(codec_embed(cb0_token));
+            // Collect the projected CP inputs (pos 0..15) so the GPU-CP forward can be validated
+            // against llama on the identical input sequence.
+            std::vector<std::vector<float>> cp_inputs;
+            if (validate_cp_gpu) { cp_inputs.push_back(talker_h); cp_inputs.push_back(cb0_emb); }
 
             llama_batch cp_prefill_batch = llama_batch_init(2, n_embd_cp, 1);
             cp_prefill_batch.n_tokens = 2;
@@ -3738,6 +3859,7 @@ int main(int argc, char ** argv) {
             for (int cb_step = 1; cb_step < n_codebooks; cb_step++) {
                 // Embed previous token using codec_embeds[cb_step - 1], projected into CP space
                 std::vector<float> step_emb = project_cp(cp_codec_embed(cb_step - 1, prev_token));
+                if (validate_cp_gpu) cp_inputs.push_back(step_emb);
 
                 // Single-token decode
                 llama_batch step_batch = llama_batch_init(1, n_embd_cp, 1);
@@ -3768,6 +3890,21 @@ int main(int argc, char ** argv) {
                                                        cp_sparams, cp_recent, rng);
                 cp_recent.push_back(frame_codes[cb_step + 1]);
                 prev_token = frame_codes[cb_step + 1];
+            }
+
+            // Validate the custom GPU-CP forward against llama on the identical input sequence:
+            // run the forward over all 16 positions, apply the same host lm_head + argmax, compare.
+            if (validate_cp_gpu && cpg.ok && (int)cp_inputs.size() == 16) {
+                int T = 16;
+                std::vector<float> X((size_t)n_embd_cp * T), hid;
+                for (int t = 0; t < T; t++) memcpy(&X[(size_t)t*n_embd_cp], cp_inputs[t].data(), n_embd_cp*sizeof(float));
+                std::vector<int32_t> pos(T); for (int t=0;t<T;t++) pos[t]=t;
+                cpg.compute_hidden(X.data(), pos.data(), T, hid);
+                for (int p = 1; p <= 15; p++) {
+                    std::vector<float> lg; cp_compute_logits(p-1, &hid[(size_t)p*n_embd_cp], lg);
+                    int am = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                    vg_total++; if (am == frame_codes[p]) vg_match++;
+                }
             }
 
             auto t_cp_end = std::chrono::high_resolution_clock::now();
@@ -3872,6 +4009,9 @@ int main(int argc, char ** argv) {
         int n_gen = (int)all_codes.size();
 
         printf("\nGeneration complete: %d frames\n", n_gen);
+        if (validate_cp_gpu && vg_total > 0)
+            printf("[validate-cp-gpu] code match: %ld/%ld (%.2f%%) -- GPU CP forward vs llama\n",
+                   vg_match, vg_total, 100.0 * vg_match / vg_total);
         printf("\n=== Performance ===\n");
         printf("  Prefill:  %d tokens in %.1f ms  (%.1f tok/s)\n",
                n_prefill, prefill_ms, n_prefill / (prefill_ms / 1000.0));
