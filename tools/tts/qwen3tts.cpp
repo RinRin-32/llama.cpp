@@ -45,6 +45,13 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+
+#define CPPHTTPLIB_NO_DEFAULT_USER_AGENT
+#include "httplib.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1897,6 +1904,31 @@ int main(int argc, char ** argv) {
     if (!cp_ctx) { fprintf(stderr, "ERROR: failed to create code predictor context\n"); return 1; }
 
     printf("Models loaded successfully.\n");
+
+    // ── HTTP server (warm) ──────────────────────────────────────────────────
+    // Models are loaded once and stay resident; requests are served without reload.
+    // sglang-omni-compatible API. /v1/audio/speech synthesis is wired on top of the
+    // batched engine in the next step; for now health/models are live.
+    if (serve_http) {
+        httplib::Server svr;
+        svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content("{\"status\":\"healthy\"}", "application/json");
+        });
+        svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
+            res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"qwen3-tts\",\"object\":\"model\",\"owned_by\":\"qwen3-tts-llama\"}]}",
+                            "application/json");
+        });
+        svr.Post("/v1/audio/speech", [](const httplib::Request &, httplib::Response & res) {
+            res.status = 501;
+            res.set_content("{\"error\":\"synthesis endpoint wiring in progress\"}", "application/json");
+        });
+        printf("[serve] HTTP server on 0.0.0.0:%d  (slots=%d)  routes: /health /v1/models /v1/audio/speech\n",
+               serve_port, n_slots);
+        svr.listen("0.0.0.0", serve_port);
+        llama_free(cp_ctx); llama_free(talker_ctx);
+        llama_model_free(cp_model); llama_model_free(talker_model);
+        return 0;
+    }
 
     // ── Initialize RNG ────────────────────────────────────────────────
     if (seed < 0) {
