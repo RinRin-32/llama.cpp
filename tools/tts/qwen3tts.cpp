@@ -1560,7 +1560,19 @@ static std::vector<float> voc_decode_audio_range(const voc_model & voc,
     if (n_frames <= 0) return audio_data;
     std::vector<std::vector<int32_t>> slice(all_codes.begin() + start, all_codes.begin() + end);
 
-    size_t ctx_size = ggml_tensor_overhead() * VOC_MAX_NODES + 128 * 1024 * 1024;
+    // The CPU backend (with its threadpool) and the graph allocator are expensive to create, so
+    // keep them alive across calls. Streaming decodes one window per chunk; re-initializing these
+    // every call was the dominant cost (turning ~RT decode into ~0.2x). The allocator grows its
+    // buffer to the largest window seen and reuses it. Only the small graph-metadata context is
+    // built per call (no_alloc=true => no tensor data here, so a modest arena suffices).
+    static ggml_backend_t backend = nullptr;
+    static ggml_gallocr_t alloc   = nullptr;
+    if (!backend) {
+        backend = ggml_backend_cpu_init();
+        alloc   = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+
+    size_t ctx_size = ggml_tensor_overhead() * VOC_MAX_NODES + 16 * 1024 * 1024;
     struct ggml_init_params ctx_params = { ctx_size, nullptr, true };
     ggml_context * voc_ctx = ggml_init(ctx_params);
     ggml_cgraph * voc_gf = voc_build_graph(voc_ctx, voc, slice);
@@ -1569,8 +1581,6 @@ static std::vector<float> voc_decode_audio_range(const voc_model & voc,
     ggml_tensor * audio_out = ggml_graph_get_tensor(voc_gf, "audio");
     ggml_tensor * pos_in    = ggml_graph_get_tensor(voc_gf, "voc_pos");
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(alloc, voc_gf);
 
     std::vector<int32_t> cb0_ids(n_frames);
@@ -1598,9 +1608,7 @@ static std::vector<float> voc_decode_audio_range(const voc_model & voc,
     audio_data.resize(n_samples);
     ggml_backend_tensor_get(audio_out, audio_data.data(), 0, n_samples * sizeof(float));
 
-    ggml_gallocr_free(alloc);
-    ggml_backend_free(backend);
-    ggml_free(voc_ctx);
+    ggml_free(voc_ctx); // keep the persistent backend + allocator alive for the next chunk
     return audio_data;
 }
 
@@ -1783,6 +1791,7 @@ int main(int argc, char ** argv) {
     std::string language = "english";
     int max_tokens = 2048;
     int stream_chunk = 0; // >0: vocode + emit every N frames (streaming); 0: one-shot at end
+    int stream_chunk_initial = 0; // >0: small first chunk for low TTFB, then ramp up to stream_chunk
     int stream_left_ctx = 32; // frames of left context re-decoded per streaming chunk (bounds cost)
     int n_gpu = 0;
     int cp_n_gpu = -1; // code predictor GPU layers; -1 => same as talker. NOTE: CP currently
@@ -1816,6 +1825,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--n-gpu-layers") == 0 && i + 1 < argc) n_gpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cp-n-gpu-layers") == 0 && i + 1 < argc) cp_n_gpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stream-chunk") == 0 && i + 1 < argc) stream_chunk = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--stream-chunk-initial") == 0 && i + 1 < argc) stream_chunk_initial = atoi(argv[++i]);
         else if (strcmp(argv[i], "--dump-intermediates") == 0 && i + 1 < argc) dump_dir = argv[++i];
         else if (strcmp(argv[i], "--language") == 0 && i + 1 < argc) language = argv[++i];
         else if (strcmp(argv[i], "--streaming-text") == 0) streaming_text = true;
@@ -2699,6 +2709,11 @@ int main(int argc, char ** argv) {
         // Skip the ICL reference frames from the output; they remain in all_codes as left-context.
         int   emitted_samples = icl_ref_frames * SAMPLES_PER_FRAME;
         int   last_decode_n   = 0;
+        // Adaptive chunk size: a small first chunk minimizes time-to-first-audio, then it ramps up to
+        // stream_chunk so most of the stream is decoded in larger, more efficient chunks (less of the
+        // left-context window is re-decoded per emitted frame). Inspired by vllm-omni's initial chunk.
+        int   stream_cur = (stream_chunk_initial > 0 && stream_chunk_initial < stream_chunk)
+                               ? stream_chunk_initial : stream_chunk;
         bool  ttfb_recorded   = false;
         double ttfb_ms        = 0.0;
         const bool streaming  = stream_chunk > 0 && voc_ready;
@@ -2804,7 +2819,8 @@ int main(int argc, char ** argv) {
             // cost is bounded (no O(n^2) re-decode of the whole sequence).
             if (streaming) {
                 int n_done = (int)all_codes.size();
-                if (n_done - last_decode_n >= stream_chunk) {
+                if (n_done - last_decode_n >= stream_cur) {
+                    stream_cur = std::min(stream_chunk, stream_cur * 2); // ramp toward the steady-state chunk
                     int safe_frames = n_done - stream_margin;
                     if (safe_frames * SAMPLES_PER_FRAME > emitted_samples) {
                         int emitted_frames = emitted_samples / SAMPLES_PER_FRAME;
