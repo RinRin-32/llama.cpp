@@ -15,8 +15,17 @@ void llama_model_qwen3tts_cp::load_arch_tensors(llama_model_loader & ml) {
     uint32_t n_cp_vocab_u32 = 0;
     ml.get_key(LLM_KV_VOCAB_SIZE, n_cp_vocab_u32, false);
 
-    // projection from talker hidden to predictor hidden (optional)
-    tts_cp_small_to_mtp = create_tensor(tn(LLM_TENSOR_TTS_CP_SMALL_TO_MTP, "weight"), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+    // Projection from talker hidden to predictor hidden. Present only when the talker and
+    // code-predictor hidden sizes differ (e.g. 1.7B: 2048 -> 1024); for 0.6B the dims are
+    // equal and the tensor is absent. It is applied host-side by the CLI before feeding
+    // embeddings, so the graph stays purely in CP-dim -- just account for the tensors here
+    // so done_getting_tensors() passes.
+    if (ml.get_weight("tts.cp.small_to_mtp.weight")) {
+        ml.n_created += 1;
+        if (ml.get_weight("tts.cp.small_to_mtp.bias")) {
+            ml.n_created += 1;
+        }
+    }
 
     // output norm
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);

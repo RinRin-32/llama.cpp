@@ -54,6 +54,42 @@
 //  WAV I/O helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Resample mono float audio to dst_sr. Linear interpolation, with a simple moving-average
+// low-pass before downsampling to curb aliasing. Good enough for the speaker encoder and the
+// speech tokenizer, both of which expect 24 kHz input.
+static std::vector<float> resample_linear(const std::vector<float> & in, int src_sr, int dst_sr) {
+    if (src_sr == dst_sr || in.empty() || src_sr <= 0 || dst_sr <= 0) return in;
+    std::vector<float> x = in;
+    if (dst_sr < src_sr) {
+        int k = src_sr / dst_sr; // anti-alias window, e.g. 2 for 48k->24k
+        if (k > 1) {
+            std::vector<float> lp(in.size());
+            int half = k / 2;
+            for (int i = 0; i < (int)in.size(); i++) {
+                float acc = 0.0f; int cnt = 0;
+                for (int j = -half; j <= half; j++) {
+                    int idx = i + j;
+                    if (idx >= 0 && idx < (int)in.size()) { acc += in[idx]; cnt++; }
+                }
+                lp[i] = acc / cnt;
+            }
+            x = std::move(lp);
+        }
+    }
+    double ratio = (double)dst_sr / (double)src_sr;
+    size_t n_out = (size_t)(x.size() * ratio);
+    std::vector<float> out(n_out);
+    for (size_t i = 0; i < n_out; i++) {
+        double pos = (double)i / ratio;
+        size_t i0 = (size_t)pos;
+        double frac = pos - (double)i0;
+        float a = x[i0];
+        float b = (i0 + 1 < x.size()) ? x[i0 + 1] : a;
+        out[i] = (float)(a * (1.0 - frac) + b * frac);
+    }
+    return out;
+}
+
 static bool read_wav(const char * path, std::vector<float> & out, int target_sr = 24000) {
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "ERROR: cannot open %s\n", path); return false; }
@@ -91,8 +127,12 @@ static bool read_wav(const char * path, std::vector<float> & out, int target_sr 
         } else { fseek(f, sz, SEEK_CUR); }
     }
     fclose(f);
-    if (sr != target_sr) {
-        fprintf(stderr, "WARN: %s sample rate %d != %d (no resampling)\n", path, sr, target_sr);
+    if (sr != target_sr && !out.empty()) {
+        int n_before = (int)out.size();
+        out = resample_linear(out, sr, target_sr);
+        printf("Resampled %s: %d Hz -> %d Hz (%d -> %d samples)\n",
+               path, sr, target_sr, n_before, (int)out.size());
+        sr = target_sr;
     }
     printf("Read %s  (%d samples, %.2fs)\n", path, (int)out.size(), (float)out.size() / sr);
     return !out.empty();
@@ -117,6 +157,28 @@ static void write_wav(const char * path, const float * samples, int n, int sr = 
     }
     fclose(f);
     printf("Wrote %s  (%d samples, %.2fs)\n", path, n, (float)n / sr);
+}
+
+// Find the zero-crossing nearest to `cut` within +/- window samples (sglang-omni style).
+// Used to place a clean cut when trimming, avoiding clicks from cutting mid-waveform.
+static int find_zero_crossing(const std::vector<float> & wav, int cut, int window = 480) {
+    int n = (int)wav.size();
+    int hw = std::min(std::min(window, cut), n - cut - 1);
+    if (hw <= 0) return cut;
+    int best = cut, best_dist = hw + 1;
+    for (int i = cut - hw; i < cut + hw; i++) {
+        if ((wav[i] >= 0.0f) != (wav[i + 1] >= 0.0f)) {
+            int d = std::abs(i - cut);
+            if (d < best_dist) { best_dist = d; best = i + 1; }
+        }
+    }
+    return best;
+}
+
+// Linear fade-in over the first `samples` samples, to smooth a hard cut (sglang-omni style).
+static void fade_in(std::vector<float> & wav, int samples = 240) {
+    int n = std::min(samples, (int)wav.size());
+    for (int i = 0; i < n && n > 1; i++) wav[i] *= (float)i / (float)(n - 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -485,7 +547,9 @@ static ggml_cgraph * spk_build_graph(ggml_context * ctx0, const spk_encoder_mode
     ggml_tensor * pooled = ggml_concat(ctx0, w_mean, w_std, 1);
 
     cur = spk_conv1d(ctx0, m.fc_w, m.fc_b, pooled, 1, 0, 1);
-    cur = ggml_reshape_1d(ctx0, cur, SPK_EMB_DIM);
+    // Embedding dim = fc output channels: 1024 for 0.6B, 2048 for 1.7B. Derive it from the
+    // weight rather than hardcoding so both model sizes work.
+    cur = ggml_reshape_1d(ctx0, cur, ggml_nelements(cur));
     ggml_set_name(cur, "embedding");
     ggml_set_output(cur);
 
@@ -1482,14 +1546,19 @@ static ggml_cgraph * voc_build_graph(ggml_context * ctx0, const voc_model & voc,
     return gf;
 }
 
-// Decode the first n_frames of all_codes into a waveform (CPU). Standalone: allocates and
+// Decode frames [start, end) of all_codes into a waveform (CPU). Standalone: allocates and
 // frees its own context/backend so it can be called repeatedly for chunked/streaming decode.
-static std::vector<float> voc_decode_audio(const voc_model & voc,
-                                           const std::vector<std::vector<int32_t>> & all_codes,
-                                           int n_frames) {
+// The pre-transformer is causal and uses RoPE, so a window decoded with 0-based positions has
+// identical relative geometry to a full decode for every retained frame; only attention mass
+// from frames before `start` is dropped, which decays with enough left context. Sample i of the
+// result corresponds to global frame `start` onward (offset start*SAMPLES_PER_FRAME).
+static std::vector<float> voc_decode_audio_range(const voc_model & voc,
+                                                 const std::vector<std::vector<int32_t>> & all_codes,
+                                                 int start, int end) {
     std::vector<float> audio_data;
+    int n_frames = end - start;
     if (n_frames <= 0) return audio_data;
-    std::vector<std::vector<int32_t>> slice(all_codes.begin(), all_codes.begin() + n_frames);
+    std::vector<std::vector<int32_t>> slice(all_codes.begin() + start, all_codes.begin() + end);
 
     size_t ctx_size = ggml_tensor_overhead() * VOC_MAX_NODES + 128 * 1024 * 1024;
     struct ggml_init_params ctx_params = { ctx_size, nullptr, true };
@@ -1533,6 +1602,13 @@ static std::vector<float> voc_decode_audio(const voc_model & voc,
     ggml_backend_free(backend);
     ggml_free(voc_ctx);
     return audio_data;
+}
+
+// Decode the first n_frames of all_codes into a waveform (one-shot, from frame 0).
+static std::vector<float> voc_decode_audio(const voc_model & voc,
+                                           const std::vector<std::vector<int32_t>> & all_codes,
+                                           int n_frames) {
+    return voc_decode_audio_range(voc, all_codes, 0, n_frames);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1707,6 +1783,7 @@ int main(int argc, char ** argv) {
     std::string language = "english";
     int max_tokens = 2048;
     int stream_chunk = 0; // >0: vocode + emit every N frames (streaming); 0: one-shot at end
+    int stream_left_ctx = 32; // frames of left context re-decoded per streaming chunk (bounds cost)
     int n_gpu = 0;
     int cp_n_gpu = -1; // code predictor GPU layers; -1 => same as talker. NOTE: CP currently
                        // produces NaN on the CPU backend (ggml CPU-backend issue in the CP graph),
@@ -1727,6 +1804,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) text = argv[++i];
         else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) max_tokens = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--stream-left-ctx") == 0 && i + 1 < argc) stream_left_ctx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) talker_sparams.temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) talker_sparams.top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) talker_sparams.top_p = (float)atof(argv[++i]);
@@ -1833,7 +1911,7 @@ int main(int argc, char ** argv) {
 
     // ── Load reference audio (shared by speaker encoder + speech tokenizer) ──
     std::vector<float> ref_audio_samples;
-    std::vector<float> speaker_embedding(SPK_EMB_DIM, 0.0f);
+    std::vector<float> speaker_embedding; // sized from the encoder output (1024 for 0.6B, 2048 for 1.7B)
     if (!ref_audio_path.empty()) {
         if (!read_wav(ref_audio_path.c_str(), ref_audio_samples)) {
             fprintf(stderr, "ERROR: cannot read reference audio\n");
@@ -1859,6 +1937,7 @@ int main(int argc, char ** argv) {
 
                     ggml_tensor * mel_in = ggml_graph_get_tensor(spk_gf, "mel_input");
                     ggml_tensor * emb_out = ggml_graph_get_tensor(spk_gf, "embedding");
+                    speaker_embedding.assign((size_t)ggml_nelements(emb_out), 0.0f);
 
                     ggml_backend_t backend = ggml_backend_cpu_init();
                     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1866,7 +1945,7 @@ int main(int argc, char ** argv) {
 
                     ggml_backend_tensor_set(mel_in, mel_data.data(), 0, mel_data.size() * sizeof(float));
                     ggml_backend_graph_compute(backend, spk_gf);
-                    ggml_backend_tensor_get(emb_out, speaker_embedding.data(), 0, SPK_EMB_DIM * sizeof(float));
+                    ggml_backend_tensor_get(emb_out, speaker_embedding.data(), 0, speaker_embedding.size() * sizeof(float));
 
                     printf("  Speaker embedding extracted (first 3: %.4f %.4f %.4f)\n",
                            speaker_embedding[0], speaker_embedding[1], speaker_embedding[2]);
@@ -2177,6 +2256,11 @@ int main(int argc, char ** argv) {
         int n_prefill;
         std::vector<float> prefill_embed;
 
+        // In ICL mode the model re-synthesizes the reference text before the target text, so the
+        // first ~n_ref_frames generated frames are the reference being spoken back. They are kept
+        // as vocoder left-context but trimmed from the emitted audio (matches the reference impl).
+        int icl_ref_frames = 0;
+
         if (icl_mode) {
             // ICL mode: generate_icl_prompt
             // Tokenize ref_text with the same chat template wrapper
@@ -2205,6 +2289,7 @@ int main(int argc, char ** argv) {
             // Build codec embed for each ref frame:
             // sum of codec_embed[codebook_i](code) over all 16 codebooks
             int n_ref_frames = (int)ref_code_frames.size();
+            icl_ref_frames = n_ref_frames; // trim this many leading frames from the output
             std::vector<std::vector<float>> ref_codec_embeds(n_ref_frames, std::vector<float>(n_embd, 0.0f));
 
             // Load CP codec embeddings for codebooks 1-15
@@ -2547,7 +2632,34 @@ int main(int argc, char ** argv) {
         printf("Code Predictor per-codebook tensors loaded (%d lm_heads, %d codec_embeds)\n",
                n_codebooks, n_codebooks);
 
-        // CP helpers: read row from per-codebook embedding, apply lm_head
+        // CP hidden size (1024). For larger talkers it is smaller than the talker hidden
+        // (n_embd), so CP inputs are projected from n_embd -> n_embd_cp by small_to_mtp.
+        const int n_embd_cp = (int)llama_model_n_embd(cp_model);
+        ggml_tensor * w_cp_s2m = cp_loader.get("tts.cp.small_to_mtp.weight"); // [n_embd, n_embd_cp] or null
+        ggml_tensor * b_cp_s2m = cp_loader.get("tts.cp.small_to_mtp.bias");   // [n_embd_cp] or null
+        if (w_cp_s2m) {
+            printf("CP talker->predictor projection: %d -> %d\n", n_embd, n_embd_cp);
+        }
+
+        // Project a talker-space embedding (n_embd) into CP hidden space (n_embd_cp).
+        // When the dims match (e.g. 0.6B, no small_to_mtp) this is the identity.
+        auto project_cp = [&](const std::vector<float> & in) -> std::vector<float> {
+            if (!w_cp_s2m) return in;
+            std::vector<float> out(n_embd_cp, 0.0f);
+            std::vector<float> w_row(n_embd);
+            for (int o = 0; o < n_embd_cp; o++) {
+                read_row(w_cp_s2m, o, w_row.data(), n_embd);
+                float acc = 0.0f;
+                for (int i = 0; i < n_embd; i++) acc += w_row[i] * in[i];
+                out[o] = acc;
+            }
+            read_bias(b_cp_s2m, out.data(), n_embd_cp);
+            return out;
+        };
+
+        // CP helpers: read row from per-codebook embedding, apply lm_head. CP codec embeddings
+        // live in talker space (n_embd) and are projected to CP space at feed time; lm_heads
+        // map CP hidden (n_embd_cp) -> vocab.
         auto cp_codec_embed = [&](int cb_idx, int32_t token_id) -> std::vector<float> {
             std::vector<float> row(n_embd);
             read_row(cp_codec_embds[cb_idx], token_id, row.data(), n_embd);
@@ -2556,11 +2668,11 @@ int main(int argc, char ** argv) {
 
         auto cp_compute_logits = [&](int cb_idx, const float * h, std::vector<float> & out) {
             out.resize(cp_vocab);
-            std::vector<float> w_row(n_embd);
+            std::vector<float> w_row(n_embd_cp);
             for (int i = 0; i < cp_vocab; i++) {
-                read_row(cp_lm_heads[cb_idx], i, w_row.data(), n_embd);
+                read_row(cp_lm_heads[cb_idx], i, w_row.data(), n_embd_cp);
                 float sum = 0.0f;
-                for (int j = 0; j < n_embd; j++) sum += h[j] * w_row[j];
+                for (int j = 0; j < n_embd_cp; j++) sum += h[j] * w_row[j];
                 out[i] = sum;
             }
         };
@@ -2584,7 +2696,8 @@ int main(int argc, char ** argv) {
         const int SAMPLES_PER_FRAME = 1920; // 12.5 Hz codec -> 24 kHz
         const int stream_margin = 6;        // frames held back so committed samples have right-context
         std::vector<float> stream_audio;    // all emitted samples (for the final WAV)
-        int   emitted_samples = 0;
+        // Skip the ICL reference frames from the output; they remain in all_codes as left-context.
+        int   emitted_samples = icl_ref_frames * SAMPLES_PER_FRAME;
         int   last_decode_n   = 0;
         bool  ttfb_recorded   = false;
         double ttfb_ms        = 0.0;
@@ -2606,15 +2719,14 @@ int main(int argc, char ** argv) {
             std::vector<int32_t> frame_codes(16, 0);
             frame_codes[0] = cb0_token;
 
-            std::vector<float> talker_h(hidden, hidden + n_embd);
+            // Prefill CP with 2 embeddings: [talker_hidden, cb0_embd], each projected into CP space.
+            std::vector<float> talker_h = project_cp(std::vector<float>(hidden, hidden + n_embd));
+            std::vector<float> cb0_emb  = project_cp(codec_embed(cb0_token));
 
-            // Prefill CP with 2 embeddings: [talker_hidden, cb0_embd]
-            std::vector<float> cb0_emb = codec_embed(cb0_token);
-
-            llama_batch cp_prefill_batch = llama_batch_init(2, n_embd, 1);
+            llama_batch cp_prefill_batch = llama_batch_init(2, n_embd_cp, 1);
             cp_prefill_batch.n_tokens = 2;
-            memcpy(cp_prefill_batch.embd,           talker_h.data(), n_embd * sizeof(float));
-            memcpy(cp_prefill_batch.embd + n_embd,  cb0_emb.data(),  n_embd * sizeof(float));
+            memcpy(cp_prefill_batch.embd,              talker_h.data(), n_embd_cp * sizeof(float));
+            memcpy(cp_prefill_batch.embd + n_embd_cp,  cb0_emb.data(),  n_embd_cp * sizeof(float));
             cp_prefill_batch.pos[0] = 0; cp_prefill_batch.pos[1] = 1;
             cp_prefill_batch.n_seq_id[0] = 1; cp_prefill_batch.n_seq_id[1] = 1;
             cp_prefill_batch.seq_id[0][0] = 0; cp_prefill_batch.seq_id[1][0] = 0;
@@ -2644,13 +2756,13 @@ int main(int argc, char ** argv) {
             // Steps 2-15: autoregressive decode for cb2..cb15
             int32_t prev_token = frame_codes[1];
             for (int cb_step = 1; cb_step < n_codebooks; cb_step++) {
-                // Embed previous token using codec_embeds[cb_step - 1]
-                std::vector<float> step_emb = cp_codec_embed(cb_step - 1, prev_token);
+                // Embed previous token using codec_embeds[cb_step - 1], projected into CP space
+                std::vector<float> step_emb = project_cp(cp_codec_embed(cb_step - 1, prev_token));
 
                 // Single-token decode
-                llama_batch step_batch = llama_batch_init(1, n_embd, 1);
+                llama_batch step_batch = llama_batch_init(1, n_embd_cp, 1);
                 step_batch.n_tokens = 1;
-                memcpy(step_batch.embd, step_emb.data(), n_embd * sizeof(float));
+                memcpy(step_batch.embd, step_emb.data(), n_embd_cp * sizeof(float));
                 step_batch.pos[0]      = 2 + (cb_step - 1); // positions 2,3,4,...,15
                 step_batch.n_seq_id[0] = 1;
                 step_batch.seq_id[0][0] = 0;
@@ -2683,18 +2795,24 @@ int main(int argc, char ** argv) {
 
             all_codes.push_back(frame_codes);
 
-            // ── Streaming: every stream_chunk frames, vocode [0,n] and emit the new tail ──
-            // We re-decode from frame 0 (consistent left context) but only commit samples that
-            // are >= stream_margin frames from the current right edge, so each emitted sample
-            // had enough right-context. Each sample is emitted exactly once -> no seam artifacts.
+            // ── Streaming: every stream_chunk frames, vocode a bounded window and emit the new tail ──
+            // Decode [win_start, n_done) with win_start held stream_left_ctx frames behind the last
+            // emitted frame, instead of from frame 0. The pre-transformer is causal + RoPE, so retained
+            // frames keep the same relative geometry as a full decode; stream_left_ctx absorbs the
+            // dropped-history error and the conv decoder's left receptive field. Right context is held
+            // back by stream_margin. Each sample is committed once -> no seam artifacts, and per-chunk
+            // cost is bounded (no O(n^2) re-decode of the whole sequence).
             if (streaming) {
                 int n_done = (int)all_codes.size();
                 if (n_done - last_decode_n >= stream_chunk) {
                     int safe_frames = n_done - stream_margin;
                     if (safe_frames * SAMPLES_PER_FRAME > emitted_samples) {
-                        std::vector<float> a = voc_decode_audio(voc, all_codes, n_done);
-                        int target = std::min((int)a.size(), safe_frames * SAMPLES_PER_FRAME);
-                        for (int i = emitted_samples; i < target; i++) stream_audio.push_back(a[i]);
+                        int emitted_frames = emitted_samples / SAMPLES_PER_FRAME;
+                        int win_start = std::max(0, emitted_frames - stream_left_ctx);
+                        int win_off   = win_start * SAMPLES_PER_FRAME; // global sample index of a[0]
+                        std::vector<float> a = voc_decode_audio_range(voc, all_codes, win_start, n_done);
+                        int target = std::min(win_off + (int)a.size(), safe_frames * SAMPLES_PER_FRAME);
+                        for (int i = emitted_samples; i < target; i++) stream_audio.push_back(a[i - win_off]);
                         if (!ttfb_recorded && target > emitted_samples) {
                             ttfb_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::high_resolution_clock::now() - t_decode_start).count();
@@ -2826,6 +2944,16 @@ int main(int argc, char ** argv) {
                        ttfb_ms, emitted_samples, emitted_samples / 24000.0, stream_chunk);
             } else {
                 std::vector<float> audio_data = voc_decode_audio(voc, all_codes, (int)all_codes.size());
+                // Trim the leading reference-text audio in ICL mode (decoded with full context, then
+                // dropped). Snap the cut to the nearest zero-crossing and fade in to avoid a click.
+                int icl_trim = icl_ref_frames * SAMPLES_PER_FRAME;
+                if (icl_trim > 0 && icl_trim < (int)audio_data.size()) {
+                    int cut = find_zero_crossing(audio_data, icl_trim);
+                    audio_data.erase(audio_data.begin(), audio_data.begin() + cut);
+                    fade_in(audio_data, 240);
+                    printf("ICL: trimmed %d ref frames, cut at %d samples (%.2fs), zero-crossing + fade-in\n",
+                           icl_ref_frames, cut, cut / 24000.0);
+                }
                 write_wav(output_path.c_str(), audio_data.data(), (int)audio_data.size(), 24000);
             }
         } else if (!voc_ready) {
