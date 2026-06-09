@@ -1785,6 +1785,9 @@ struct cp_gpu {
     std::vector<lw> L;
     ggml_tensor *out_norm=nullptr, *s2m_w=nullptr, *s2m_b=nullptr;
     std::vector<ggml_tensor*> codec_embd, lm_head; // [15] each
+    // persistent unrolled decode graph (fixed topology: 16 positions, built once, inputs swapped/frame)
+    ggml_context* dctx=nullptr; ggml_cgraph* dgf=nullptr; ggml_gallocr_t dalloc=nullptr;
+    ggml_tensor *dX0=nullptr,*dX1=nullptr,*dpos=nullptr,*dG=nullptr; ggml_tensor* dtoks[15]={};
 
     bool init(const char * cp_path) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -1870,6 +1873,92 @@ struct cp_gpu {
         hid.resize((size_t)n_embd*T);
         ggml_backend_tensor_get(H, hid.data(), 0, hid.size()*sizeof(float));
         ggml_free(c);
+    }
+
+    // One decoder layer for a single new position p, attending over the running KV cache.
+    // Kc/Vc are [head_dim, n_head_kv, <=p] (or null at p==0); returns updated x and grows Kc/Vc.
+    ggml_tensor* layer_step(ggml_context*c, const lw&l, ggml_tensor*x, ggml_tensor*posp,
+                            ggml_tensor*&Kc, ggml_tensor*&Vc){
+        ggml_tensor* res=x;
+        ggml_tensor* n=rn(c,x,l.attn_norm);
+        ggml_tensor* Q=ggml_reshape_3d(c,ggml_mul_mat(c,l.wq,n),head_dim,n_head,1);
+        ggml_tensor* K=ggml_reshape_3d(c,ggml_mul_mat(c,l.wk,n),head_dim,n_head_kv,1);
+        ggml_tensor* V=ggml_reshape_3d(c,ggml_mul_mat(c,l.wv,n),head_dim,n_head_kv,1);
+        Q=rn(c,Q,l.q_norm); K=rn(c,K,l.k_norm);
+        Q=ggml_rope_ext(c,Q,posp,nullptr,head_dim,GGML_ROPE_TYPE_NEOX,0,rope_theta,1.f,0.f,1.f,0.f,0.f);
+        K=ggml_rope_ext(c,K,posp,nullptr,head_dim,GGML_ROPE_TYPE_NEOX,0,rope_theta,1.f,0.f,1.f,0.f,0.f);
+        Kc = Kc ? ggml_concat(c,Kc,K,2) : K;                        // [head_dim, n_head_kv, p+1]
+        Vc = Vc ? ggml_concat(c,Vc,V,2) : V;
+        ggml_tensor* Qp=ggml_permute(c,Q,0,2,1,3);                  // [head_dim, 1, n_head]
+        ggml_tensor* Kp=ggml_permute(c,Kc,0,2,1,3);                 // [head_dim, p+1, n_head_kv]
+        ggml_tensor* KQ=ggml_mul_mat(c,Kp,Qp);                      // GQA bcast -> [p+1, 1, n_head]
+        KQ=ggml_soft_max(c,ggml_scale(c,KQ,1.f/sqrtf((float)head_dim))); // no mask: attends to all cached
+        ggml_tensor* Vt=ggml_cont(c,ggml_permute(c,Vc,1,2,0,3));    // [p+1, head_dim, n_head_kv]
+        ggml_tensor* O=ggml_mul_mat(c,Vt,KQ);                       // -> [head_dim, 1, n_head]
+        O=ggml_cont_2d(c,ggml_permute(c,O,0,2,1,3),head_dim*n_head,1);
+        x=ggml_add(c,res,ggml_mul_mat(c,l.wo,O));
+        ggml_tensor* r2=x; n=rn(c,x,l.ffn_norm);
+        ggml_tensor* g=ggml_silu(c,ggml_mul_mat(c,l.ffn_gate,n));
+        ggml_tensor* u=ggml_mul_mat(c,l.ffn_up,n);
+        return ggml_add(c,r2,ggml_mul_mat(c,l.ffn_down,ggml_mul(c,g,u)));
+    }
+
+    // Build the persistent unrolled decode graph once (fixed topology). Sampling is
+    // argmax(logits + G_col); temperature is folded into G on the host (argmax(logits/T + g) ==
+    // argmax(logits + T*g)), so the graph never changes. Greedy => G all-zero.
+    void build_decode(){
+        dctx = ggml_init({ ggml_tensor_overhead()*16384 + ggml_graph_overhead_custom(8192,false) + 8*1024*1024, nullptr, true });
+        ggml_context* c = dctx;
+        dX0=ggml_new_tensor_1d(c,GGML_TYPE_F32,n_embd); ggml_set_input(dX0);
+        dX1=ggml_new_tensor_1d(c,GGML_TYPE_F32,n_embd); ggml_set_input(dX1);
+        dpos=ggml_new_tensor_1d(c,GGML_TYPE_I32,16);    ggml_set_input(dpos);
+        dG=ggml_new_tensor_2d(c,GGML_TYPE_F32,vocab,15);ggml_set_input(dG);
+        auto posp=[&](int p){ return ggml_view_1d(c,dpos,1,(size_t)p*sizeof(int32_t)); };
+        std::vector<ggml_tensor*> Kc(n_layer,nullptr), Vc(n_layer,nullptr);
+        auto step=[&](ggml_tensor* x,int p)->ggml_tensor*{
+            for(int il=0;il<n_layer;il++) x=layer_step(c,L[il],x,posp(p),Kc[il],Vc[il]);
+            return rn(c,x,out_norm);
+        };
+        auto sample=[&](ggml_tensor* h,int cb)->ggml_tensor*{
+            ggml_tensor* lg=ggml_mul_mat(c,lm_head[cb],h);                          // [vocab,1]
+            ggml_tensor* gcol=ggml_view_1d(c,dG,vocab,(size_t)cb*vocab*sizeof(float));
+            lg=ggml_add(c,lg,ggml_reshape_2d(c,gcol,vocab,1));
+            return ggml_argmax(c,lg);                                              // [1] i32
+        };
+        auto feed=[&](ggml_tensor* tok,int cb)->ggml_tensor*{
+            ggml_tensor* e=ggml_get_rows(c,codec_embd[cb],tok);
+            ggml_tensor* in=ggml_mul_mat(c,s2m_w,e);
+            if (s2m_b) in=ggml_add(c,in,ggml_reshape_2d(c,s2m_b,n_embd,1));
+            return in;
+        };
+        step(dX0,0);
+        ggml_tensor* h=step(dX1,1);
+        dtoks[0]=sample(h,0);
+        for(int p=2;p<=15;p++){ ggml_tensor* in=feed(dtoks[p-2],p-2); h=step(in,p); dtoks[p-1]=sample(h,p-1); }
+        dgf=ggml_new_graph_custom(c,8192,false);
+        for(int i=0;i<15;i++){ ggml_set_output(dtoks[i]); ggml_build_forward_expand(dgf,dtoks[i]); }
+        dalloc=ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        ggml_gallocr_alloc_graph(dalloc,dgf);
+        int32_t pv[16]; for(int i=0;i<16;i++) pv[i]=i; ggml_backend_tensor_set(dpos,pv,0,sizeof(pv));
+    }
+    // Full autoregressive frame in ONE graph compute. in0,in1 = prefill embeddings (host-projected);
+    // gumbel = vocab*15 noise (already temp-scaled), or null for greedy. Writes cb1..cb15 to out_codes[1..15].
+    void decode_frame(const float* in0, const float* in1, const float* gumbel, int32_t* out_codes){
+        if (!dgf) build_decode();
+        ggml_backend_tensor_set(dX0,in0,0,(size_t)n_embd*sizeof(float));
+        ggml_backend_tensor_set(dX1,in1,0,(size_t)n_embd*sizeof(float));
+        if (gumbel) ggml_backend_tensor_set(dG,gumbel,0,(size_t)vocab*15*sizeof(float));
+        else        ggml_backend_tensor_set(dG,std::vector<float>((size_t)vocab*15,0.f).data(),0,(size_t)vocab*15*sizeof(float));
+        bool prof = getenv("QWEN_PROFILE");
+        auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_graph_compute(be,dgf);
+        ggml_backend_synchronize(be);
+        auto t1 = std::chrono::steady_clock::now();
+        for(int i=0;i<15;i++) ggml_backend_tensor_get(dtoks[i],out_codes+1+i,0,sizeof(int32_t));
+        if (prof) { auto t2=std::chrono::steady_clock::now();
+            fprintf(stderr,"[cpgpu] compute=%.2fms reads=%.2fms\n",
+                std::chrono::duration<double,std::milli>(t1-t0).count(),
+                std::chrono::duration<double,std::milli>(t2-t1).count()); }
     }
 };
 
@@ -2177,6 +2266,7 @@ int main(int argc, char ** argv) {
                        // so keep it on GPU until that is fixed.
     bool streaming_text = false;
     bool validate_cp_gpu = false; // compare the custom GPU CP forward vs llama's CP per frame
+    bool use_cp_gpu = true;       // default: generate with the custom GPU CP (on-device sampling); --no-cp-gpu reverts to llama
 
     tts_sampler_params talker_sparams;
     tts_sampler_params cp_sparams;
@@ -2207,6 +2297,8 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--n-gpu-layers") == 0 && i + 1 < argc) n_gpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cp-n-gpu-layers") == 0 && i + 1 < argc) cp_n_gpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--validate-cp-gpu") == 0) validate_cp_gpu = true;
+        else if (strcmp(argv[i], "--use-cp-gpu") == 0) use_cp_gpu = true;
+        else if (strcmp(argv[i], "--no-cp-gpu") == 0) use_cp_gpu = false;
         else if (strcmp(argv[i], "--stream-chunk") == 0 && i + 1 < argc) stream_chunk = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stream-chunk-initial") == 0 && i + 1 < argc) stream_chunk_initial = atoi(argv[++i]);
         else if (strcmp(argv[i], "--dump-intermediates") == 0 && i + 1 < argc) dump_dir = argv[++i];
@@ -3794,11 +3886,17 @@ int main(int argc, char ** argv) {
         const bool streaming  = stream_chunk > 0 && voc_ready;
 
         // Optional custom GPU code-predictor validation (compare its forward to llama per frame).
-        cp_gpu cpg; long vg_total = 0, vg_match = 0;
-        if (validate_cp_gpu) {
-            if (cpg.init(cp_path.c_str())) printf("[validate-cp-gpu] GPU CP engine ready (run with --greedy for a deterministic compare)\n");
-            else fprintf(stderr, "[validate-cp-gpu] GPU CP engine init failed\n");
+        cp_gpu cpg; long vg_total = 0, vg_match = 0; double vg_ms = 0; int vg_frames = 0;
+        if (validate_cp_gpu || use_cp_gpu) {
+            if (cpg.init(cp_path.c_str())) printf("[cp-gpu] GPU CP engine ready%s\n", use_cp_gpu?" (generating with GPU CP)":" (validation)");
+            else { fprintf(stderr, "[cp-gpu] GPU CP engine init failed\n"); use_cp_gpu = false; }
         }
+        // Gumbel-max temperature sampling for the GPU CP: argmax(logits/T + g) == argmax(logits + T*g),
+        // so feed the engine T-scaled Gumbel noise. (No top-k/rep-penalty yet -- temperature only.)
+        auto gumbel_noise = [&](std::vector<float>& G, float temp){
+            std::uniform_real_distribution<float> U(1e-9f, 1.f);
+            for (auto & g : G) { float u1=U(rng), u2=U(rng); g = temp * (-logf(-logf(u1))); (void)u2; }
+        };
 
         for (int frame = 0; frame < max_tokens; frame++) {
             if (cb0_token == (int)codec_eos_id) {
@@ -3815,6 +3913,15 @@ int main(int argc, char ** argv) {
 
             std::vector<int32_t> frame_codes(16, 0);
             frame_codes[0] = cb0_token;
+
+          if (use_cp_gpu && cpg.ok) {
+            // Generate the whole frame on the GPU CP (one graph, on-device sampling).
+            std::vector<float> p0 = project_cp(std::vector<float>(hidden, hidden + n_embd));
+            std::vector<float> p1 = project_cp(codec_embed(cb0_token));
+            std::vector<float> G((size_t)15 * cp_vocab);
+            if (!cp_sparams.greedy) gumbel_noise(G, cp_sparams.temp);
+            cpg.decode_frame(p0.data(), p1.data(), cp_sparams.greedy ? nullptr : G.data(), frame_codes.data());
+          } else {
 
             // Prefill CP with 2 embeddings: [talker_hidden, cb0_embd], each projected into CP space.
             std::vector<float> talker_h = project_cp(std::vector<float>(hidden, hidden + n_embd));
@@ -3894,18 +4001,16 @@ int main(int argc, char ** argv) {
 
             // Validate the custom GPU-CP forward against llama on the identical input sequence:
             // run the forward over all 16 positions, apply the same host lm_head + argmax, compare.
-            if (validate_cp_gpu && cpg.ok && (int)cp_inputs.size() == 16) {
-                int T = 16;
-                std::vector<float> X((size_t)n_embd_cp * T), hid;
-                for (int t = 0; t < T; t++) memcpy(&X[(size_t)t*n_embd_cp], cp_inputs[t].data(), n_embd_cp*sizeof(float));
-                std::vector<int32_t> pos(T); for (int t=0;t<T;t++) pos[t]=t;
-                cpg.compute_hidden(X.data(), pos.data(), T, hid);
-                for (int p = 1; p <= 15; p++) {
-                    std::vector<float> lg; cp_compute_logits(p-1, &hid[(size_t)p*n_embd_cp], lg);
-                    int am = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
-                    vg_total++; if (am == frame_codes[p]) vg_match++;
-                }
+            if (validate_cp_gpu && cpg.ok && (int)cp_inputs.size() >= 2) {
+                // Full unrolled single-graph autoregressive frame (greedy, on-GPU sampling + feedback).
+                int32_t my[16] = {0}; my[0] = cb0_token;
+                auto _v0 = std::chrono::high_resolution_clock::now();
+                cpg.decode_frame(cp_inputs[0].data(), cp_inputs[1].data(), nullptr, my);
+                vg_ms += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_v0).count();
+                for (int p = 1; p <= 15; p++) { vg_total++; if (my[p] == frame_codes[p]) vg_match++; }
             }
+
+          } // end llama-CP vs use-cp-gpu branch
 
             auto t_cp_end = std::chrono::high_resolution_clock::now();
             cp_decode_ms += std::chrono::duration<double, std::milli>(t_cp_end - t_cp_start).count();
@@ -4009,9 +4114,12 @@ int main(int argc, char ** argv) {
         int n_gen = (int)all_codes.size();
 
         printf("\nGeneration complete: %d frames\n", n_gen);
-        if (validate_cp_gpu && vg_total > 0)
-            printf("[validate-cp-gpu] code match: %ld/%ld (%.2f%%) -- GPU CP forward vs llama\n",
-                   vg_match, vg_total, 100.0 * vg_match / vg_total);
+        if (validate_cp_gpu && vg_total > 0) {
+            int vf = (int)(vg_total / 15);
+            printf("[validate-cp-gpu] code match: %ld/%ld (%.2f%%) | GPU-CP frame %.2f ms/frame vs llama-CP %.2f ms/frame\n",
+                   vg_match, vg_total, 100.0 * vg_match / vg_total,
+                   vf ? vg_ms / vf : 0.0, n_gen ? cp_decode_ms / n_gen : 0.0);
+        }
         printf("\n=== Performance ===\n");
         printf("  Prefill:  %d tokens in %.1f ms  (%.1f tok/s)\n",
                n_prefill, prefill_ms, n_prefill / (prefill_ms / 1000.0));
