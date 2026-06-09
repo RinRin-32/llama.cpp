@@ -1725,7 +1725,12 @@ struct gpu_vocoder {
 
         size_t cs = ggml_tensor_overhead()*VOC_MAX_NODES + 32*1024*1024;
         ggml_context * c = ggml_init({ cs, nullptr, true });
-        ggml_cgraph * gf = voc_build_graph(c, vocg, slice, /*gpu_path=*/true);
+        // Default: conv_transpose runs on the CPU (sched routes just those ops there) because
+        // ggml's CUDA conv_transpose_1d kernel is ~20x slower; everything else runs on the GPU.
+        // ~330ms/clip vs ~33s if conv_transpose is forced onto CUDA. QWEN_VOC_CONVT_GPU=1 forces
+        // the (slow) all-GPU path for experiments.
+        bool gp = getenv("QWEN_VOC_CONVT_GPU") && atoi(getenv("QWEN_VOC_CONVT_GPU"));
+        ggml_cgraph * gf = voc_build_graph(c, vocg, slice, gp);
 
         ggml_backend_sched_reset(sched);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) { ggml_free(c); return audio; }
@@ -1744,12 +1749,17 @@ struct gpu_vocoder {
         for (int f=0; f<n_frames; f++) ids[f] = f;
         ggml_backend_tensor_set(pos_in, ids.data(), 0, n_frames*sizeof(int32_t));
 
+        auto _t0 = std::chrono::steady_clock::now();
         ggml_backend_sched_graph_compute(sched, gf);
 
         ggml_tensor * ao = ggml_graph_get_tensor(gf, "audio");
         int ns = (int)ggml_nelements(ao);
         audio.resize(ns);
         ggml_backend_tensor_get(ao, audio.data(), 0, ns*sizeof(float));
+        if (getenv("QWEN_PROFILE")) {
+            double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_t0).count();
+            fprintf(stderr, "[gpuvoc] %d frames -> %d samples (%.2fs audio) in %.1f ms\n", n_frames, ns, ns/24000.0, ms);
+        }
         ggml_free(c);
         return audio;
     }
@@ -2138,6 +2148,10 @@ int main(int argc, char ** argv) {
     talker_cparams.n_seq_max  = n_slots;
     talker_cparams.no_perf    = true;
     talker_cparams.embeddings = true;
+    // Models are fully GPU-offloaded, so the CPU threadpool mostly spin-waits on GPU completion
+    // and steals cores from the vocode pool. Cap it (QWEN_LLAMA_THREADS) to free cores for vocode.
+    int llama_threads = getenv("QWEN_LLAMA_THREADS") ? std::max(1, atoi(getenv("QWEN_LLAMA_THREADS"))) : 0;
+    if (llama_threads) { talker_cparams.n_threads = llama_threads; talker_cparams.n_threads_batch = llama_threads; }
     llama_context * talker_ctx = llama_init_from_model(talker_model, talker_cparams);
     if (!talker_ctx) { fprintf(stderr, "ERROR: failed to create talker context\n"); return 1; }
 
@@ -2151,6 +2165,7 @@ int main(int argc, char ** argv) {
     cp_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp_cparams.type_k     = GGML_TYPE_F32;
     cp_cparams.type_v     = GGML_TYPE_F32;
+    if (llama_threads) { cp_cparams.n_threads = llama_threads; cp_cparams.n_threads_batch = llama_threads; }
     llama_context * cp_ctx = llama_init_from_model(cp_model, cp_cparams);
     if (!cp_ctx) { fprintf(stderr, "ERROR: failed to create code predictor context\n"); return 1; }
 
@@ -3151,27 +3166,29 @@ int main(int argc, char ** argv) {
             struct voc_job { std::shared_ptr<req_t> req; std::vector<std::vector<int32_t>> codes; int icl_ref; };
             std::deque<std::shared_ptr<voc_job>> vq; std::mutex vqm; std::condition_variable vqcv;
             const int SPF_VOC = 1920;
-            // Optional GPU vocoder (QWEN_VOC_GPU=1): one mutex-guarded engine the workers share.
+            // Vocoder backend. GPU vocode (transformer + im2col convs on GPU, conv_transpose on
+            // CPU via the sched) is ~330ms/clip vs ~1.4s on CPU, and it runs INLINE on the
+            // scheduler thread so only one host thread ever touches CUDA (no device wedge -- ggml's
+            // CUDA backend is not multi-thread-safe). Default ON when a GPU is present; set
+            // QWEN_VOC_GPU=0 to force the CPU vocode worker pool instead.
             std::unique_ptr<gpu_vocoder> gpu_voc;
-            if (voc_ready && getenv("QWEN_VOC_GPU")) {
+            bool want_gpu_voc = voc_ready && !(getenv("QWEN_VOC_GPU") && atoi(getenv("QWEN_VOC_GPU"))==0);
+            if (want_gpu_voc) {
                 gpu_voc = std::make_unique<gpu_vocoder>();
-                if (gpu_voc->init(voc_loader)) {
-                    printf("[serve] vocoder backend: GPU (sched gpu+cpu)\n");
-                    fprintf(stderr, "[serve] WARNING: QWEN_VOC_GPU is EXPERIMENTAL and UNSAFE under concurrent load.\n"
-                                    "        The GPU vocode worker threads submit CUDA work concurrently with the\n"
-                                    "        generation threads on the same device; ggml's CUDA backend is not\n"
-                                    "        multi-thread-safe and the device can wedge. Use only at concurrency 1,\n"
-                                    "        or prefer the default CPU vocode pool.\n");
-                } else { gpu_voc.reset(); printf("[serve] vocoder backend: GPU init failed -> CPU pool\n"); }
+                if (gpu_voc->init(voc_loader)) printf("[serve] vocoder backend: GPU inline (conv_transpose on CPU)\n");
+                else { gpu_voc.reset(); printf("[serve] vocoder backend: no GPU -> CPU pool\n"); }
             }
-            int n_voc_workers = gpu_voc ? 3 : 6; // GPU decode is mutex-serialized; a few workers pipeline the CPU-side trim
-            if (const char* e=getenv("QWEN_VOC_WORKERS")) n_voc_workers = std::max(1, atoi(e));
-            if (!getenv("QWEN_VOC_THREADS")) {
-                unsigned hw = std::thread::hardware_concurrency(); if (!hw) hw = 8;
-                char b[16]; snprintf(b, sizeof(b), "%d", std::max(1u, hw / (unsigned)n_voc_workers));
-                setenv("QWEN_VOC_THREADS", b, 1);
+            const bool voc_gpu_inline = (bool)gpu_voc;        // GPU vocode always runs inline (safe)
+            int n_voc_workers = voc_gpu_inline ? 0 : 6;        // CPU pool only used when no GPU vocode
+            if (!voc_gpu_inline) {
+                if (const char* e=getenv("QWEN_VOC_WORKERS")) n_voc_workers = std::max(1, atoi(e));
+                if (!getenv("QWEN_VOC_THREADS")) {
+                    unsigned hw = std::thread::hardware_concurrency(); if (!hw) hw = 8;
+                    char b[16]; snprintf(b, sizeof(b), "%d", std::max(1u, hw / (unsigned)n_voc_workers));
+                    setenv("QWEN_VOC_THREADS", b, 1);
+                }
+                printf("[serve] vocode pool: %d workers x %s threads\n", n_voc_workers, getenv("QWEN_VOC_THREADS"));
             }
-            printf("[serve] vocode pool: %d workers x %s threads\n", n_voc_workers, getenv("QWEN_VOC_THREADS"));
             std::vector<std::thread> vworkers;
             for (int w=0; w<n_voc_workers; w++) vworkers.emplace_back([&](){
                 while (running) {
@@ -3242,6 +3259,16 @@ int main(int argc, char ** argv) {
                 // Normal completion: stream -> flush tail + done; non-stream -> full WAV via promise.
                 auto finalize = [&](int s){
                     if (S[s].req->stream) { stream_emit(s, true); S[s].req->finish_stream(); }
+                    else if (voc_gpu_inline) {
+                        // Inline GPU vocode on the scheduler thread (only thread touching CUDA).
+                        std::vector<float> pcm;
+                        auto _fv=CLK();
+                        if (voc_ready && !S[s].codes.empty()) pcm = gpu_voc->decode(S[s].codes, 0, (int)S[s].codes.size());
+                        P.finvoc+=EL(_fv);
+                        int trim = S[s].icl_ref_frames * SPF;
+                        if (trim > 0 && trim < (int)pcm.size()) { int cut=find_zero_crossing(pcm,trim); pcm.erase(pcm.begin(),pcm.begin()+cut); fade_in(pcm,240); }
+                        S[s].req->result.set_value(std::move(pcm));
+                    }
                     else {
                         // Hand the finished codes to the vocode pool and free the slot now; a worker
                         // vocodes + trims off-thread and fulfills the request's promise.
