@@ -2828,13 +2828,31 @@ int main(int argc, char ** argv) {
             // GPU head matmuls: offload the per-frame logits (codec_head, CP lm_heads) from the
             // CPU dot loops to batched GPU GEMMs. Falls back to CPU if no GPU backend.
             gpu_gemm gg; bool gg_ok = gg.init();
-            int GG_HEAD=-1; std::vector<int> GG_CPLM(n_codebooks,-1);
+            int GG_HEAD=-1, GG_S2M=-1; std::vector<int> GG_CPLM(n_codebooks,-1);
             if (gg_ok) {
                 GG_HEAD = gg.add(w_codec_head);
                 for (int i=0;i<n_codebooks;i++) GG_CPLM[i] = gg.add(cp_lm_heads[i]);
+                if (w_cp_s2m) GG_S2M = gg.add(w_cp_s2m);
                 gg_ok = gg.finalize();
             }
-            printf("[serve] gpu head matmuls: %s\n", gg_ok ? "on" : "off (CPU fallback)");
+            std::vector<float> s2m_bias;
+            if (b_cp_s2m) { s2m_bias.resize((size_t)ggml_nelements(b_cp_s2m)); dequant_to_f32(b_cp_s2m, s2m_bias.data()); }
+            printf("[serve] gpu head matmuls: %s  (projection %s)\n",
+                   gg_ok ? "on" : "off (CPU fallback)", (gg_ok && GG_S2M>=0) ? "gpu" : (w_cp_s2m ? "cpu" : "identity"));
+
+            // Project a batch of n_embd inputs [n_embd, na] -> [n_embd_cp, na] (small_to_mtp + bias).
+            auto proj_batch = [&](const std::vector<float> & in, int na_, std::vector<float> & out) {
+                if (gg_ok && GG_S2M>=0) {
+                    gg.run(GG_S2M, in.data(), na_, out);
+                    if (!s2m_bias.empty()) for (int k=0;k<na_;k++) for (int o=0;o<n_embd_cp;o++) out[(size_t)k*n_embd_cp+o]+=s2m_bias[o];
+                } else if (!w_cp_s2m) {
+                    out = in; // dims equal (e.g. 0.6B): identity
+                } else {
+                    out.resize((size_t)n_embd_cp*na_);
+                    for (int k=0;k<na_;k++){ std::vector<float> v(in.begin()+(size_t)k*n_embd, in.begin()+(size_t)(k+1)*n_embd);
+                        std::vector<float> p=project_cp(v); memcpy(&out[(size_t)k*n_embd_cp], p.data(), n_embd_cp*sizeof(float)); }
+                }
+            };
 
             // Per-request prefill. Base voice, x-vector clone (ref_audio only), or ICL clone
             // (ref_audio + ref_text). icl_ref returns the number of leading frames to trim.
@@ -3043,12 +3061,16 @@ int main(int argc, char ** argv) {
                     std::vector<std::vector<int32_t>> fc(N, std::vector<int32_t>(16,0));
                     for (int s : st){ fc[s][0]=S[s].cb0; cprec[s].clear(); llama_memory_seq_rm(cmem,s,-1,-1); }
                     cpb.n_tokens = 2*na;
-                    for (int k=0;k<na;k++){ int s=st[k];
-                        std::vector<float> th=project_cp(S[s].hidden), e0=project_cp(codec_embed(S[s].cb0));
-                        memcpy(cpb.embd+(2*k)*n_embd_cp, th.data(), n_embd_cp*sizeof(float));
-                        memcpy(cpb.embd+(2*k+1)*n_embd_cp, e0.data(), n_embd_cp*sizeof(float));
-                        cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
-                        cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; }
+                    { std::vector<float> Hh((size_t)n_embd*na), E0((size_t)n_embd*na), thP, e0P;
+                      for (int k=0;k<na;k++){ int s=st[k];
+                          memcpy(&Hh[(size_t)k*n_embd], S[s].hidden.data(), n_embd*sizeof(float));
+                          std::vector<float> e=codec_embed(S[s].cb0); memcpy(&E0[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
+                      proj_batch(Hh, na, thP); proj_batch(E0, na, e0P);
+                      for (int k=0;k<na;k++){ int s=st[k];
+                          memcpy(cpb.embd+(2*k)*n_embd_cp,   &thP[(size_t)k*n_embd_cp], n_embd_cp*sizeof(float));
+                          memcpy(cpb.embd+(2*k+1)*n_embd_cp, &e0P[(size_t)k*n_embd_cp], n_embd_cp*sizeof(float));
+                          cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
+                          cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; } }
                     if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) fail(s); continue; }
                     // CP step 0 logits: batched GPU GEMM (cp lm_head[0]) across slots, else CPU.
                     { std::vector<float> H((size_t)n_embd_cp*na), L;
@@ -3059,8 +3081,10 @@ int main(int argc, char ** argv) {
                           fc[s][1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); } }
                     for (int cb_step=1; cb_step<n_codebooks; cb_step++){
                         cpb.n_tokens=na;
-                        for(int k=0;k<na;k++){int s=st[k]; std::vector<float> se=project_cp(cp_codec_embed(cb_step-1,fc[s][cb_step]));
-                            memcpy(cpb.embd+k*n_embd_cp,se.data(),n_embd_cp*sizeof(float)); cpb.pos[k]=2+(cb_step-1); cpb.n_seq_id[k]=1; cpb.seq_id[k][0]=s; cpb.logits[k]=1;}
+                        { std::vector<float> Se((size_t)n_embd*na), seP;
+                          for(int k=0;k<na;k++){int s=st[k]; std::vector<float> e=cp_codec_embed(cb_step-1,fc[s][cb_step]); memcpy(&Se[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
+                          proj_batch(Se, na, seP);
+                          for(int k=0;k<na;k++){int s=st[k]; memcpy(cpb.embd+k*n_embd_cp,&seP[(size_t)k*n_embd_cp],n_embd_cp*sizeof(float)); cpb.pos[k]=2+(cb_step-1); cpb.n_seq_id[k]=1; cpb.seq_id[k][0]=s; cpb.logits[k]=1;} }
                         if (llama_decode(cp_ctx,cpb)!=0) break;
                         std::vector<float> H((size_t)n_embd_cp*na), L;
                         for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,k), n_embd_cp*sizeof(float));
