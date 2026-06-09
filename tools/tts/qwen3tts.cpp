@@ -1646,6 +1646,65 @@ static std::vector<float> voc_decode_audio(const voc_model & voc,
     return voc_decode_audio_range(voc, all_codes, 0, n_frames);
 }
 
+// Dequantize a (bf16/f16/f32) tensor's full contents to an f32 buffer, preserving layout.
+static void dequant_to_f32(const ggml_tensor * t, float * out) {
+    int64_t n = ggml_nelements(t);
+    if (t->type == GGML_TYPE_F32) { memcpy(out, t->data, (size_t)n * sizeof(float)); }
+    else if (t->type == GGML_TYPE_F16) { const ggml_fp16_t * s=(const ggml_fp16_t*)t->data; for (int64_t i=0;i<n;i++) out[i]=ggml_fp16_to_fp32(s[i]); }
+    else if (t->type == GGML_TYPE_BF16) { ggml_bf16_to_fp32_row((const ggml_bf16_t*)t->data, out, n); }
+    else { memset(out, 0, (size_t)n*sizeof(float)); }
+}
+
+// Persistent GPU GEMM engine for the per-frame "head" matmuls (codec_head, CP lm_heads,
+// small_to_mtp projection). These otherwise run on the CPU (read_row + dot) and dominate
+// batched throughput. Weights are uploaded once (f32); each call runs one mul_mat on the GPU
+// across all active slots: out[out_dim, N] = mul_mat(weight[in_dim,out_dim], x[in_dim,N]).
+struct gpu_gemm {
+    ggml_backend_t be = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_context * wctx = nullptr;
+    struct spec { int in, out; const ggml_tensor * src; };
+    std::vector<spec> specs;
+    std::vector<ggml_tensor*> w;
+
+    bool ok() const { return be != nullptr; }
+    bool init() {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) return false;
+        be = ggml_backend_dev_init(dev, nullptr);
+        if (!be) return false;
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        return true;
+    }
+    int add(const ggml_tensor * src) { specs.push_back({(int)src->ne[0], (int)src->ne[1], src}); return (int)specs.size()-1; }
+    bool finalize() {
+        if (!be) return false;
+        wctx = ggml_init({ specs.size()*ggml_tensor_overhead() + 4096, nullptr, true });
+        for (auto & s : specs) w.push_back(ggml_new_tensor_2d(wctx, GGML_TYPE_F32, s.in, s.out));
+        if (!ggml_backend_alloc_ctx_tensors(wctx, be)) return false;
+        for (size_t i=0;i<specs.size();i++) {
+            std::vector<float> buf((size_t)specs[i].in * specs[i].out);
+            dequant_to_f32(specs[i].src, buf.data());
+            ggml_backend_tensor_set(w[i], buf.data(), 0, buf.size()*sizeof(float));
+        }
+        return true;
+    }
+    // x: [in_dim, N] row-major (slot-major: x[n*in + i]); out: [out_dim, N] (out[n*out + o]).
+    void run(int idx, const float * x, int N, std::vector<float> & out) {
+        int in=specs[idx].in, o=specs[idx].out;
+        ggml_context * c = ggml_init({ ggml_tensor_overhead()*8 + ggml_graph_overhead() + 4096, nullptr, true });
+        ggml_tensor * X = ggml_new_tensor_2d(c, GGML_TYPE_F32, in, N);
+        ggml_tensor * Y = ggml_mul_mat(c, w[idx], X);
+        ggml_cgraph * gf = ggml_new_graph(c); ggml_build_forward_expand(gf, Y);
+        ggml_gallocr_alloc_graph(alloc, gf);
+        ggml_backend_tensor_set(X, x, 0, (size_t)in*N*sizeof(float));
+        ggml_backend_graph_compute(be, gf);
+        out.resize((size_t)o*N);
+        ggml_backend_tensor_get(Y, out.data(), 0, out.size()*sizeof(float));
+        ggml_free(c);
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Sampling (temperature, top-k, top-p, repetition penalty)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2766,6 +2825,17 @@ int main(int argc, char ** argv) {
                 return emb;
             };
 
+            // GPU head matmuls: offload the per-frame logits (codec_head, CP lm_heads) from the
+            // CPU dot loops to batched GPU GEMMs. Falls back to CPU if no GPU backend.
+            gpu_gemm gg; bool gg_ok = gg.init();
+            int GG_HEAD=-1; std::vector<int> GG_CPLM(n_codebooks,-1);
+            if (gg_ok) {
+                GG_HEAD = gg.add(w_codec_head);
+                for (int i=0;i<n_codebooks;i++) GG_CPLM[i] = gg.add(cp_lm_heads[i]);
+                gg_ok = gg.finalize();
+            }
+            printf("[serve] gpu head matmuls: %s\n", gg_ok ? "on" : "off (CPU fallback)");
+
             // Per-request prefill. Base voice, x-vector clone (ref_audio only), or ICL clone
             // (ref_audio + ref_text). icl_ref returns the number of leading frames to trim.
             auto tok_wrap = [&](const std::string & s) {
@@ -2980,17 +3050,24 @@ int main(int argc, char ** argv) {
                         cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
                         cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; }
                     if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) fail(s); continue; }
-                    for (int k=0;k<na;k++){ int s=st[k]; std::vector<float> buf;
-                        cp_compute_logits(0, llama_get_embeddings_ith(cp_ctx,2*k+1), buf);
-                        fc[s][1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); }
+                    // CP step 0 logits: batched GPU GEMM (cp lm_head[0]) across slots, else CPU.
+                    { std::vector<float> H((size_t)n_embd_cp*na), L;
+                      for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,2*k+1), n_embd_cp*sizeof(float));
+                      if (gg_ok) gg.run(GG_CPLM[0], H.data(), na, L);
+                      for (int k=0;k<na;k++){ int s=st[k]; std::vector<float> buf; float* lg;
+                          if (gg_ok) lg=&L[(size_t)k*cp_vocab]; else { cp_compute_logits(0,&H[(size_t)k*n_embd_cp],buf); lg=buf.data(); }
+                          fc[s][1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); } }
                     for (int cb_step=1; cb_step<n_codebooks; cb_step++){
                         cpb.n_tokens=na;
                         for(int k=0;k<na;k++){int s=st[k]; std::vector<float> se=project_cp(cp_codec_embed(cb_step-1,fc[s][cb_step]));
                             memcpy(cpb.embd+k*n_embd_cp,se.data(),n_embd_cp*sizeof(float)); cpb.pos[k]=2+(cb_step-1); cpb.n_seq_id[k]=1; cpb.seq_id[k][0]=s; cpb.logits[k]=1;}
                         if (llama_decode(cp_ctx,cpb)!=0) break;
-                        for(int k=0;k<na;k++){int s=st[k]; std::vector<float> buf;
-                            cp_compute_logits(cb_step, llama_get_embeddings_ith(cp_ctx,k), buf);
-                            fc[s][cb_step+1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][cb_step+1]); }
+                        std::vector<float> H((size_t)n_embd_cp*na), L;
+                        for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,k), n_embd_cp*sizeof(float));
+                        if (gg_ok) gg.run(GG_CPLM[cb_step], H.data(), na, L);
+                        for(int k=0;k<na;k++){int s=st[k]; std::vector<float> buf; float* lg;
+                            if (gg_ok) lg=&L[(size_t)k*cp_vocab]; else { cp_compute_logits(cb_step,&H[(size_t)k*n_embd_cp],buf); lg=buf.data(); }
+                            fc[s][cb_step+1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][cb_step+1]); }
                     }
                     for (int s:st) S[s].codes.push_back(fc[s]);
                     for (int s:st) if (S[s].req->stream) stream_emit(s, false); // push incremental PCM
@@ -3006,10 +3083,14 @@ int main(int argc, char ** argv) {
                         for(int d=0;d<3;d++)tb.pos[d*na+k]=S[s].tpos; tb.pos[3*na+k]=0;
                         tb.n_seq_id[k]=1; tb.seq_id[k][0]=s; tb.logits[k]=1; }
                     if (llama_decode(talker_ctx,tb)!=0){ for(int s:st) fail(s); continue; }
-                    for(int k=0;k<na;k++){ int s=st[k]; const float* h=llama_get_embeddings_ith(talker_ctx,k);
-                        S[s].hidden.assign(h,h+n_embd); std::vector<float> cl; compute_logits(h,cl);
-                        S[s].cb0=tts_sample(cl.data(),n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
-                        S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; }
+                    // Talker cb0 logits: batched GPU GEMM (codec_head) across slots, else CPU.
+                    { std::vector<float> Hh((size_t)n_embd*na), L;
+                      for (int k=0;k<na;k++){ const float* h=llama_get_embeddings_ith(talker_ctx,k); S[st[k]].hidden.assign(h,h+n_embd); memcpy(&Hh[(size_t)k*n_embd],h,n_embd*sizeof(float)); }
+                      if (gg_ok) gg.run(GG_HEAD, Hh.data(), na, L);
+                      for(int k=0;k<na;k++){ int s=st[k]; std::vector<float> cl; float* lg;
+                          if (gg_ok) lg=&L[(size_t)k*n_codec_vocab]; else { compute_logits(&Hh[(size_t)k*n_embd],cl); lg=cl.data(); }
+                          S[s].cb0=tts_sample(lg,n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
+                          S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; } }
                 }
                 llama_batch_free(pf); llama_batch_free(tb); llama_batch_free(cpb);
             });
