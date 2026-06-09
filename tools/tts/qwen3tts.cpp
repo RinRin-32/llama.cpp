@@ -3225,7 +3225,7 @@ int main(int argc, char ** argv) {
                 std::vector<sslot> S(N);
                 // --- per-stage profiling (env QWEN_PROFILE), single scheduler thread so plain doubles are safe ---
                 const bool PROF = getenv("QWEN_PROFILE")!=nullptr;
-                struct { double dec=0, aux=0, read=0, samp=0, voc=0, frame=0, finvoc=0, prefill=0; long frames=0, iters=0; } P;
+                struct { double dec=0, aux=0, read=0, samp=0, voc=0, frame=0, finvoc=0, prefill=0, cp=0, tk=0; long frames=0, iters=0; } P;
                 auto CLK=[](){ return std::chrono::steady_clock::now(); };
                 auto EL =[&](std::chrono::steady_clock::time_point t){ return std::chrono::duration<double,std::milli>(CLK()-t).count(); };
                 const int SPF=1920, SV_CHUNK=12, SV_LEFT=16, SV_MARGIN=6;
@@ -3330,6 +3330,7 @@ int main(int argc, char ** argv) {
                     if (st.empty()) continue;
                     int na = (int)st.size();
                     auto _fr = CLK();
+                    auto _cp = CLK();
 
                     // Batched code predictor (frame-synchronized across slots).
                     std::vector<std::vector<int32_t>> fc(N, std::vector<int32_t>(16,0));
@@ -3383,7 +3384,9 @@ int main(int argc, char ** argv) {
                         P.samp+=EL(_s);
                     }
                     for (int s:st) S[s].codes.push_back(fc[s]);
+                    P.cp += EL(_cp);
                     { auto _v=CLK(); for (int s:st) if (S[s].req->stream) stream_emit(s, false); P.voc+=EL(_v); } // push incremental PCM
+                    auto _tk = CLK();
 
                     // Batched talker step (one summed-frame embedding per slot). The 16 codec
                     // embedding gathers + sum + tts_pad run as one fused GPU op when available.
@@ -3416,11 +3419,12 @@ int main(int argc, char ** argv) {
                           S[s].cb0=tts_sample(lg,n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
                           S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; }
                       P.samp+=EL(_s); }
+                    P.tk += EL(_tk);
                     P.frame+=EL(_fr); P.iters++; P.frames+=na;
                     if (PROF && P.iters%200==0) {
-                        double t=P.frame; printf("[prof] iters=%ld frames=%ld | LOOP %.1fms/iter: dec=%.0f%% aux=%.0f%% read=%.0f%% samp=%.0f%% voc=%.0f%% other=%.0f%% | OUTSIDE-LOOP totals: prefill=%.0fms finalize_vocode=%.0fms loop=%.0fms\n",
+                        double t=P.frame; printf("[prof] iters=%ld frames=%ld | LOOP %.1fms/iter: dec=%.0f%% aux=%.0f%% read=%.0f%% samp=%.0f%% voc=%.0f%% other=%.0f%% | CP=%.0f%% talker=%.0f%% | OUTSIDE: prefill=%.0fms finalize_vocode=%.0fms loop=%.0fms\n",
                             P.iters,P.frames, t/P.iters, 100*P.dec/t,100*P.aux/t,100*P.read/t,100*P.samp/t,100*P.voc/t,
-                            100*(t-P.dec-P.aux-P.read-P.samp-P.voc)/t, P.prefill, P.finvoc, P.frame);
+                            100*(t-P.dec-P.aux-P.read-P.samp-P.voc)/t, 100*P.cp/t, 100*P.tk/t, P.prefill, P.finvoc, P.frame);
                         fflush(stdout);
                     }
                 }
