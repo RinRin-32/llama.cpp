@@ -49,9 +49,13 @@
 #include <condition_variable>
 #include <deque>
 #include <atomic>
+#include <thread>
+#include <future>
+#include <memory>
 
 #define CPPHTTPLIB_NO_DEFAULT_USER_AGENT
 #include "httplib.h"
+#include "nlohmann/json.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -164,6 +168,22 @@ static void write_wav(const char * path, const float * samples, int n, int sr = 
     }
     fclose(f);
     printf("Wrote %s  (%d samples, %.2fs)\n", path, n, (float)n / sr);
+}
+
+// Encode mono f32 [-1,1] samples to an in-memory 16-bit PCM WAV (for HTTP responses).
+static std::string wav_bytes(const float * samples, int n, int sr = 24000) {
+    auto p32 = [](std::string & s, uint32_t v) { for (int i = 0; i < 4; i++) s.push_back((char)((v >> (8*i)) & 0xff)); };
+    auto p16 = [](std::string & s, uint16_t v) { for (int i = 0; i < 2; i++) s.push_back((char)((v >> (8*i)) & 0xff)); };
+    std::string s; uint32_t dsz = (uint32_t)n * 2;
+    s += "RIFF"; p32(s, 36 + dsz); s += "WAVE"; s += "fmt "; p32(s, 16);
+    p16(s, 1); p16(s, 1); p32(s, (uint32_t)sr); p32(s, (uint32_t)sr * 2); p16(s, 2); p16(s, 16);
+    s += "data"; p32(s, dsz);
+    for (int i = 0; i < n; i++) {
+        float v = fmaxf(-1.0f, fminf(1.0f, samples[i]));
+        int16_t q = (int16_t)(v * 32767.0f);
+        s.push_back((char)(q & 0xff)); s.push_back((char)((q >> 8) & 0xff));
+    }
+    return s;
 }
 
 // Find the zero-crossing nearest to `cut` within +/- window samples (sglang-omni style).
@@ -1862,6 +1882,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "ERROR: --text is required\n");
         return 1;
     }
+    if (serve_http && text.empty()) text = "warm up"; // throwaway prefill; server re-prefills per request
 
     // ── Load Talker model ──────────────────────────────────────────────────
     printf("Loading Talker model: %s\n", talker_path.c_str());
@@ -1904,31 +1925,6 @@ int main(int argc, char ** argv) {
     if (!cp_ctx) { fprintf(stderr, "ERROR: failed to create code predictor context\n"); return 1; }
 
     printf("Models loaded successfully.\n");
-
-    // ── HTTP server (warm) ──────────────────────────────────────────────────
-    // Models are loaded once and stay resident; requests are served without reload.
-    // sglang-omni-compatible API. /v1/audio/speech synthesis is wired on top of the
-    // batched engine in the next step; for now health/models are live.
-    if (serve_http) {
-        httplib::Server svr;
-        svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
-            res.set_content("{\"status\":\"healthy\"}", "application/json");
-        });
-        svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
-            res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"qwen3-tts\",\"object\":\"model\",\"owned_by\":\"qwen3-tts-llama\"}]}",
-                            "application/json");
-        });
-        svr.Post("/v1/audio/speech", [](const httplib::Request &, httplib::Response & res) {
-            res.status = 501;
-            res.set_content("{\"error\":\"synthesis endpoint wiring in progress\"}", "application/json");
-        });
-        printf("[serve] HTTP server on 0.0.0.0:%d  (slots=%d)  routes: /health /v1/models /v1/audio/speech\n",
-               serve_port, n_slots);
-        svr.listen("0.0.0.0", serve_port);
-        llama_free(cp_ctx); llama_free(talker_ctx);
-        llama_model_free(cp_model); llama_model_free(talker_model);
-        return 0;
-    }
 
     // ── Initialize RNG ────────────────────────────────────────────────
     if (seed < 0) {
@@ -2731,13 +2727,207 @@ int main(int argc, char ** argv) {
         };
 
         // ════════════════════════════════════════════════════════════════════
+        //  Phase 2: warm HTTP server with continuous batching (sglang-omni API).
+        //  Models stay resident; requests arrive via HTTP, are admitted into free
+        //  slots (per-request prefill), and decode together through the batched
+        //  engine. One scheduler thread owns the llama contexts; HTTP handlers only
+        //  touch the request queue + per-request promise.
+        // ════════════════════════════════════════════════════════════════════
+        if (serve_http) {
+            const int N = n_slots;
+            llama_memory_t tmem = llama_get_memory(talker_ctx);
+            llama_memory_t cmem = llama_get_memory(cp_ctx);
+
+            // Base-voice prefill (no ref/ICL) for a request's text+language.
+            auto build_prefill = [&](const std::string & rtext, const std::string & rlang,
+                                     std::vector<float> & pe, int & npf) {
+                std::string prompt = "<|im_start|>assistant\n" + rtext + "<|im_end|>\n<|im_start|>assistant\n";
+                std::vector<llama_token> toks(prompt.size() + 32);
+                int nt = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(), toks.data(), (int)toks.size(), false, true);
+                if (nt < 0) { toks.resize(-nt); nt = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(), toks.data(), (int)toks.size(), false, true); }
+                toks.resize(nt);
+                std::vector<int32_t> ids(toks.begin(), toks.end());
+                std::vector<float> tproj = text_project(ids);
+                std::string ll = rlang; std::transform(ll.begin(), ll.end(), ll.begin(), ::tolower);
+                auto it = LANGUAGE_IDS.find(ll);
+                uint32_t lang_id = (it != LANGUAGE_IDS.end()) ? it->second : LANGUAGE_IDS.at("english");
+                std::vector<uint32_t> pre;
+                if (lang_id != 0) pre = { codec_think_id, codec_think_bos, lang_id, codec_think_eos };
+                else              pre = { codec_nothink, codec_think_bos, codec_think_eos };
+                pre.push_back(codec_pad_id); pre.push_back(codec_bos_id);
+                std::vector<std::vector<float>> pe_emb; for (uint32_t id : pre) pe_emb.push_back(codec_embed((int32_t)id));
+                int ncp = (int)pe_emb.size();
+                int n_text_content = std::max(0, nt - 8);
+                int ncp_pre = ncp - 1, nts = n_text_content + 1;
+                npf = 3 + ncp_pre + nts + 1;
+                pe.assign((size_t)npf * n_embd, 0.0f);
+                std::vector<float> cpad = codec_embed((int32_t)codec_pad_id);
+                int pos = 0;
+                for (int i = 0; i < 3; i++) { memcpy(&pe[pos*n_embd], &tproj[i*n_embd], n_embd*sizeof(float)); pos++; }
+                for (int i = 0; i < ncp - 2; i++) { for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[i][j]; pos++; }
+                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_bos_embed[j]+pe_emb[ncp-2][j]; pos++;
+                for (int i = 0; i < n_text_content; i++) { for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tproj[(3+i)*n_embd+j]+cpad[j]; pos++; }
+                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_eos_embed[j]+cpad[j]; pos++;
+                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[ncp-1][j]; pos++;
+            };
+
+            struct req_t {
+                std::string text, language;
+                tts_sampler_params tsp, csp;
+                int max_tok = 2048; uint32_t seed = 0;
+                std::promise<std::vector<float>> result;
+            };
+            std::deque<std::shared_ptr<req_t>> queue;
+            std::mutex qmu; std::condition_variable qcv;
+            std::atomic<bool> running{true};
+
+            std::thread sched([&]() {
+                struct sslot {
+                    bool active=false; std::shared_ptr<req_t> req;
+                    std::vector<float> hidden; int cb0=0,tpos=0,gstep=0;
+                    std::vector<int32_t> recent;
+                    std::vector<std::vector<int32_t>> codes;
+                    std::mt19937 rng;
+                };
+                std::vector<sslot> S(N);
+                llama_batch pf = llama_batch_init(2048, n_embd, N);
+                free(pf.pos); pf.pos = (llama_pos*)malloc(sizeof(llama_pos)*2048*n_pos_per_embd);
+                llama_batch tb = llama_batch_init(N, n_embd, N);
+                free(tb.pos); tb.pos = (llama_pos*)malloc(sizeof(llama_pos)*N*n_pos_per_embd);
+                llama_batch cpb = llama_batch_init(2*N, n_embd_cp, N);
+                std::vector<std::vector<int32_t>> cprec(N);
+
+                auto finish = [&](int s, std::vector<float> pcm){ S[s].req->result.set_value(std::move(pcm)); llama_memory_seq_rm(tmem,s,-1,-1); S[s].active=false; S[s].req.reset(); };
+
+                while (running) {
+                    // Admit waiting requests into free slots (per-request prefill).
+                    for (int s = 0; s < N; s++) {
+                        if (S[s].active) continue;
+                        std::shared_ptr<req_t> r;
+                        { std::lock_guard<std::mutex> lk(qmu); if (!queue.empty()) { r = queue.front(); queue.pop_front(); } }
+                        if (!r) break;
+                        std::vector<float> pe; int npf=0;
+                        build_prefill(r->text, r->language, pe, npf);
+                        llama_memory_seq_rm(tmem, s, -1, -1);
+                        pf.n_tokens = npf;
+                        memset(pf.pos, 0, sizeof(llama_pos)*2048*n_pos_per_embd);
+                        for (int i=0;i<npf;i++){
+                            memcpy(pf.embd+i*n_embd, &pe[i*n_embd], n_embd*sizeof(float));
+                            for(int d=0;d<3;d++) pf.pos[d*npf+i]=i;
+                            pf.pos[3*npf+i]=0;
+                            pf.n_seq_id[i]=1; pf.seq_id[i][0]=s; pf.logits[i]=(i==npf-1)?1:0;
+                        }
+                        if (llama_decode(talker_ctx, pf)!=0){ r->result.set_value({}); continue; }
+                        const float* h = llama_get_embeddings_ith(talker_ctx, npf-1);
+                        S[s].hidden.assign(h, h+n_embd);
+                        std::vector<float> cl; compute_logits(h, cl);
+                        S[s].rng = std::mt19937(r->seed); S[s].recent.clear();
+                        S[s].cb0 = tts_sample(cl.data(), n_codec_vocab, r->tsp, S[s].recent, S[s].rng);
+                        S[s].recent.push_back(S[s].cb0);
+                        S[s].tpos=npf; S[s].gstep=0; S[s].codes.clear(); S[s].req=r; S[s].active=true;
+                    }
+
+                    std::vector<int> act; for (int s=0;s<N;s++) if (S[s].active) act.push_back(s);
+                    if (act.empty()) {
+                        std::unique_lock<std::mutex> lk(qmu);
+                        qcv.wait_for(lk, std::chrono::milliseconds(50), [&]{ return !queue.empty() || !running; });
+                        continue;
+                    }
+
+                    // Finalize finished slots; collect the rest to step.
+                    std::vector<int> st;
+                    for (int s : act) {
+                        if (S[s].cb0 == (int)codec_eos_id || S[s].gstep >= S[s].req->max_tok) {
+                            std::vector<float> pcm;
+                            if (voc_ready && !S[s].codes.empty()) pcm = voc_decode_audio(voc, S[s].codes, (int)S[s].codes.size());
+                            finish(s, std::move(pcm));
+                        } else st.push_back(s);
+                    }
+                    if (st.empty()) continue;
+                    int na = (int)st.size();
+
+                    // Batched code predictor (frame-synchronized across slots).
+                    std::vector<std::vector<int32_t>> fc(N, std::vector<int32_t>(16,0));
+                    for (int s : st){ fc[s][0]=S[s].cb0; cprec[s].clear(); llama_memory_seq_rm(cmem,s,-1,-1); }
+                    cpb.n_tokens = 2*na;
+                    for (int k=0;k<na;k++){ int s=st[k];
+                        std::vector<float> th=project_cp(S[s].hidden), e0=project_cp(codec_embed(S[s].cb0));
+                        memcpy(cpb.embd+(2*k)*n_embd_cp, th.data(), n_embd_cp*sizeof(float));
+                        memcpy(cpb.embd+(2*k+1)*n_embd_cp, e0.data(), n_embd_cp*sizeof(float));
+                        cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
+                        cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; }
+                    if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) finish(s,{}); continue; }
+                    for (int k=0;k<na;k++){ int s=st[k]; std::vector<float> buf;
+                        cp_compute_logits(0, llama_get_embeddings_ith(cp_ctx,2*k+1), buf);
+                        fc[s][1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); }
+                    for (int cb_step=1; cb_step<n_codebooks; cb_step++){
+                        cpb.n_tokens=na;
+                        for(int k=0;k<na;k++){int s=st[k]; std::vector<float> se=project_cp(cp_codec_embed(cb_step-1,fc[s][cb_step]));
+                            memcpy(cpb.embd+k*n_embd_cp,se.data(),n_embd_cp*sizeof(float)); cpb.pos[k]=2+(cb_step-1); cpb.n_seq_id[k]=1; cpb.seq_id[k][0]=s; cpb.logits[k]=1;}
+                        if (llama_decode(cp_ctx,cpb)!=0) break;
+                        for(int k=0;k<na;k++){int s=st[k]; std::vector<float> buf;
+                            cp_compute_logits(cb_step, llama_get_embeddings_ith(cp_ctx,k), buf);
+                            fc[s][cb_step+1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][cb_step+1]); }
+                    }
+                    for (int s:st) S[s].codes.push_back(fc[s]);
+
+                    // Batched talker step (one summed-frame embedding per slot).
+                    tb.n_tokens=na; memset(tb.pos,0,sizeof(llama_pos)*N*n_pos_per_embd);
+                    for (int k=0;k<na;k++){ int s=st[k];
+                        std::vector<float> ne(n_embd,0.f); std::vector<float> e0=codec_embed(fc[s][0]);
+                        for(int j=0;j<n_embd;j++)ne[j]+=e0[j];
+                        for(int cbi=0;cbi<n_codebooks;cbi++){std::vector<float> ec=cp_codec_embed(cbi,fc[s][cbi+1]); for(int j=0;j<n_embd;j++)ne[j]+=ec[j];}
+                        for(int j=0;j<n_embd;j++)ne[j]+=tts_pad_embed[j];
+                        memcpy(tb.embd+k*n_embd,ne.data(),n_embd*sizeof(float));
+                        for(int d=0;d<3;d++)tb.pos[d*na+k]=S[s].tpos; tb.pos[3*na+k]=0;
+                        tb.n_seq_id[k]=1; tb.seq_id[k][0]=s; tb.logits[k]=1; }
+                    if (llama_decode(talker_ctx,tb)!=0){ for(int s:st) finish(s,{}); continue; }
+                    for(int k=0;k<na;k++){ int s=st[k]; const float* h=llama_get_embeddings_ith(talker_ctx,k);
+                        S[s].hidden.assign(h,h+n_embd); std::vector<float> cl; compute_logits(h,cl);
+                        S[s].cb0=tts_sample(cl.data(),n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
+                        S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; }
+                }
+                llama_batch_free(pf); llama_batch_free(tb); llama_batch_free(cpb);
+            });
+
+            auto jstr=[](const nlohmann::json&j,const char*k,const std::string&d){ return j.contains(k)&&j[k].is_string()?j[k].get<std::string>():d; };
+            httplib::Server svr;
+            svr.Get("/health",[](const httplib::Request&,httplib::Response&res){ res.set_content("{\"status\":\"healthy\"}","application/json"); });
+            svr.Get("/v1/models",[](const httplib::Request&,httplib::Response&res){ res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\"qwen3-tts\",\"object\":\"model\",\"owned_by\":\"qwen3-tts-llama\"}]}","application/json"); });
+            svr.Post("/v1/audio/speech",[&](const httplib::Request&req,httplib::Response&res){
+                nlohmann::json j;
+                try { j = nlohmann::json::parse(req.body); } catch(...) { res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
+                auto r = std::make_shared<req_t>();
+                r->text = jstr(j,"input",""); r->language = jstr(j,"language","english");
+                r->tsp = talker_sparams; r->csp = cp_sparams;
+                if (j.contains("temperature")&&j["temperature"].is_number()) r->tsp.temp=j["temperature"].get<float>();
+                if (j.contains("top_k")&&j["top_k"].is_number()) r->tsp.top_k=j["top_k"].get<int>();
+                if (j.contains("top_p")&&j["top_p"].is_number()) r->tsp.top_p=j["top_p"].get<float>();
+                r->max_tok = (j.contains("max_new_tokens")&&j["max_new_tokens"].is_number())?j["max_new_tokens"].get<int>():max_tokens;
+                r->seed = (j.contains("seed")&&j["seed"].is_number())?(uint32_t)j["seed"].get<long long>():(uint32_t)std::random_device{}();
+                if (r->text.empty()){ res.status=400; res.set_content("{\"error\":\"input required\"}","application/json"); return; }
+                auto fut = r->result.get_future();
+                { std::lock_guard<std::mutex> lk(qmu); queue.push_back(r); } qcv.notify_one();
+                std::vector<float> pcm = fut.get();
+                std::string wav = wav_bytes(pcm.data(), (int)pcm.size(), 24000);
+                res.set_header("X-Audio-Sample-Rate","24000");
+                res.set_content(wav, "audio/wav");
+            });
+            printf("[serve] HTTP server on 0.0.0.0:%d (slots=%d): POST /v1/audio/speech | GET /health /v1/models\n", serve_port, N);
+            svr.listen("0.0.0.0", serve_port);
+            running=false; qcv.notify_all(); sched.join();
+            llama_batch_free(batch);
+            goto cleanup;
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         //  Phase 1: warm continuous-batching engine (test path).
         //  Runs `serve_slots` copies of this request concurrently through ONE warm
         //  model, batching the talker decode (multi-seq llama_batch) and the
         //  code-predictor (frame-synchronized) across slots. Proves true batching
         //  before the HTTP/WS API is layered on top.
         // ════════════════════════════════════════════════════════════════════
-        if (serve_slots >= 1) { // >=1 so N=1 isolates batched-loop bugs from multi-seq bugs
+        if (serve_slots >= 1 && !serve_http) { // >=1 so N=1 isolates batched-loop bugs from multi-seq bugs
             const int N = serve_slots;
             llama_memory_t talker_mem = llama_get_memory(talker_ctx);
             llama_memory_t cp_mem     = llama_get_memory(cp_ctx);

@@ -10,7 +10,7 @@ endif()
 set(TARGET2 llama-qwen3tts)
 add_executable(${TARGET2} qwen3tts.cpp)
 target_link_libraries(${TARGET2} PRIVATE llama llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-target_include_directories(${TARGET2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+target_include_directories(${TARGET2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib ${CMAKE_SOURCE_DIR}/vendor)
 target_compile_features(${TARGET2} PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)
