@@ -158,6 +158,10 @@ def synthesize(text, language, max_tokens, ref_audio_path=None,
         "--cp-temp", str(cp_temp),
         "--cp-top-k", str(cp_top_k),
     ]
+    if os.environ.get("LLAMA_N_GPU_LAYERS"):
+        cmd += ["--n-gpu-layers", os.environ["LLAMA_N_GPU_LAYERS"]]
+    if os.environ.get("LLAMA_CP_N_GPU_LAYERS"):
+        cmd += ["--cp-n-gpu-layers", os.environ["LLAMA_CP_N_GPU_LAYERS"]]
     if vocoder:
         cmd += ["--model-vocoder", vocoder]
     if ref_audio_path:
