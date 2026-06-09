@@ -2738,41 +2738,112 @@ int main(int argc, char ** argv) {
             llama_memory_t tmem = llama_get_memory(talker_ctx);
             llama_memory_t cmem = llama_get_memory(cp_ctx);
 
-            // Base-voice prefill (no ref/ICL) for a request's text+language.
+            // Voice cloning: load the speaker encoder (talker GGUF) and the ICL audio encoder
+            // (vocoder GGUF) once; both run on CPU and are reused across requests.
+            gguf_tensor_loader spk_loader, enc_loader; spk_encoder_model spk_model; enc_model enc_m;
+            bool spk_ok = spk_loader.load(talker_path.c_str(), "spk_enc.") && spk_load_weights(spk_loader, spk_model);
+            bool enc_ok = !vocoder_path.empty() && enc_loader.load(vocoder_path.c_str(), "tok_enc.") && enc_load_weights(enc_loader, enc_m);
+            printf("[serve] speaker_encoder=%s  icl_audio_encoder=%s\n", spk_ok?"on":"off", enc_ok?"on":"off");
+
+            auto extract_spk = [&](const std::vector<float> & samples) -> std::vector<float> {
+                std::vector<float> emb;
+                if (!spk_ok) return emb;
+                int nf=0; std::vector<float> mel;
+                if (!compute_mel_spectrogram(samples.data(), (int)samples.size(), mel, nf)) return emb;
+                size_t cs = ggml_tensor_overhead()*SPK_MAX_NODES + 256*1024*1024;
+                ggml_context * c = ggml_init({cs, nullptr, true});
+                ggml_cgraph * gf = spk_build_graph(c, spk_model, nf);
+                ggml_tensor * mi = ggml_graph_get_tensor(gf, "mel_input");
+                ggml_tensor * eo = ggml_graph_get_tensor(gf, "embedding");
+                emb.assign((size_t)ggml_nelements(eo), 0.f);
+                ggml_backend_t b = ggml_backend_cpu_init();
+                ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(b));
+                ggml_gallocr_alloc_graph(al, gf);
+                ggml_backend_tensor_set(mi, mel.data(), 0, mel.size()*sizeof(float));
+                ggml_backend_graph_compute(b, gf);
+                ggml_backend_tensor_get(eo, emb.data(), 0, emb.size()*sizeof(float));
+                ggml_gallocr_free(al); ggml_backend_free(b); ggml_free(c);
+                return emb;
+            };
+
+            // Per-request prefill. Base voice, x-vector clone (ref_audio only), or ICL clone
+            // (ref_audio + ref_text). icl_ref returns the number of leading frames to trim.
+            auto tok_wrap = [&](const std::string & s) {
+                std::string p = "<|im_start|>assistant\n" + s + "<|im_end|>\n<|im_start|>assistant\n";
+                std::vector<llama_token> t(p.size() + 32);
+                int n = llama_tokenize(vocab, p.c_str(), (int)p.size(), t.data(), (int)t.size(), false, true);
+                if (n < 0) { t.resize(-n); n = llama_tokenize(vocab, p.c_str(), (int)p.size(), t.data(), (int)t.size(), false, true); }
+                t.resize(n); return t;
+            };
             auto build_prefill = [&](const std::string & rtext, const std::string & rlang,
-                                     std::vector<float> & pe, int & npf) {
-                std::string prompt = "<|im_start|>assistant\n" + rtext + "<|im_end|>\n<|im_start|>assistant\n";
-                std::vector<llama_token> toks(prompt.size() + 32);
-                int nt = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(), toks.data(), (int)toks.size(), false, true);
-                if (nt < 0) { toks.resize(-nt); nt = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(), toks.data(), (int)toks.size(), false, true); }
-                toks.resize(nt);
+                                     const std::string & raudio, const std::string & rreftext,
+                                     std::vector<float> & pe, int & npf, int & icl_ref) {
+                icl_ref = 0;
+                std::vector<llama_token> toks = tok_wrap(rtext); int nt=(int)toks.size();
                 std::vector<int32_t> ids(toks.begin(), toks.end());
                 std::vector<float> tproj = text_project(ids);
                 std::string ll = rlang; std::transform(ll.begin(), ll.end(), ll.begin(), ::tolower);
                 auto it = LANGUAGE_IDS.find(ll);
                 uint32_t lang_id = (it != LANGUAGE_IDS.end()) ? it->second : LANGUAGE_IDS.at("english");
-                std::vector<uint32_t> pre;
-                if (lang_id != 0) pre = { codec_think_id, codec_think_bos, lang_id, codec_think_eos };
-                else              pre = { codec_nothink, codec_think_bos, codec_think_eos };
-                pre.push_back(codec_pad_id); pre.push_back(codec_bos_id);
+
+                bool has_spk = !raudio.empty();
+                std::vector<float> spk_emb; std::vector<std::vector<int32_t>> ref_frames;
+                if (has_spk) {
+                    std::vector<float> samp;
+                    if (read_wav(raudio.c_str(), samp)) {
+                        spk_emb = extract_spk(samp);
+                        if (!rreftext.empty() && enc_ok) enc_encode_audio(enc_m, samp.data(), (int)samp.size(), 16, ref_frames);
+                    }
+                    if (spk_emb.empty()) has_spk = false;
+                }
+                bool icl = has_spk && !rreftext.empty() && !ref_frames.empty();
+
+                std::vector<uint32_t> pre = (lang_id!=0)
+                    ? std::vector<uint32_t>{codec_think_id,codec_think_bos,lang_id,codec_think_eos}
+                    : std::vector<uint32_t>{codec_nothink,codec_think_bos,codec_think_eos};
                 std::vector<std::vector<float>> pe_emb; for (uint32_t id : pre) pe_emb.push_back(codec_embed((int32_t)id));
-                int ncp = (int)pe_emb.size();
-                int n_text_content = std::max(0, nt - 8);
-                int ncp_pre = ncp - 1, nts = n_text_content + 1;
-                npf = 3 + ncp_pre + nts + 1;
-                pe.assign((size_t)npf * n_embd, 0.0f);
+                if (has_spk) pe_emb.push_back(spk_emb);
+                pe_emb.push_back(codec_embed((int32_t)codec_pad_id));
+                pe_emb.push_back(codec_embed((int32_t)codec_bos_id));
+                int ncp=(int)pe_emb.size(), ncp_pre=ncp-1, n_text_content=std::max(0,nt-8);
                 std::vector<float> cpad = codec_embed((int32_t)codec_pad_id);
-                int pos = 0;
-                for (int i = 0; i < 3; i++) { memcpy(&pe[pos*n_embd], &tproj[i*n_embd], n_embd*sizeof(float)); pos++; }
-                for (int i = 0; i < ncp - 2; i++) { for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[i][j]; pos++; }
-                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_bos_embed[j]+pe_emb[ncp-2][j]; pos++;
-                for (int i = 0; i < n_text_content; i++) { for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tproj[(3+i)*n_embd+j]+cpad[j]; pos++; }
-                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_eos_embed[j]+cpad[j]; pos++;
-                for (int j=0;j<n_embd;j++) pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[ncp-1][j]; pos++;
+
+                if (icl) {
+                    std::vector<llama_token> rtk = tok_wrap(rreftext); int nrt=(int)rtk.size();
+                    int n_ref_content = std::max(0, nrt-8);
+                    std::vector<int32_t> rids(rtk.begin(), rtk.end());
+                    std::vector<float> rproj = text_project(rids);
+                    int nrf=(int)ref_frames.size(); icl_ref=nrf;
+                    std::vector<std::vector<float>> rce(nrf, std::vector<float>(n_embd,0.f));
+                    for (int f=0;f<nrf;f++){ auto& fr=ref_frames[f]; std::vector<float> e0=codec_embed(fr[0]);
+                        for(int j=0;j<n_embd;j++) rce[f][j]+=e0[j];
+                        for(int cb=1;cb<16&&cb<(int)fr.size();cb++){ std::vector<float> ce(n_embd); read_row(cp_codec_embds[cb-1],fr[cb],ce.data(),n_embd); for(int j=0;j<n_embd;j++) rce[f][j]+=ce[j]; } }
+                    int nts = n_ref_content + n_text_content + 1;
+                    npf = 3 + ncp_pre + (nts + nrf + 1) + 1;
+                    pe.assign((size_t)npf*n_embd,0.f); int pos=0;
+                    for(int i=0;i<3;i++){memcpy(&pe[pos*n_embd],&tproj[i*n_embd],n_embd*sizeof(float));pos++;}
+                    for(int i=0;i<ncp-2;i++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[i][j];pos++;}
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_bos_embed[j]+pe_emb[ncp-2][j];pos++;
+                    for(int i=0;i<n_ref_content;i++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=rproj[(3+i)*n_embd+j]+cpad[j];pos++;}
+                    for(int i=0;i<n_text_content;i++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tproj[(3+i)*n_embd+j]+cpad[j];pos++;}
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_eos_embed[j]+cpad[j];pos++;
+                    { std::vector<float> cb=codec_embed((int32_t)codec_bos_id); for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+cb[j]; pos++; }
+                    for(int f=0;f<nrf;f++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+rce[f][j];pos++;}
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[ncp-1][j];pos++;
+                } else {
+                    int nts=n_text_content+1; npf=3+ncp_pre+nts+1;
+                    pe.assign((size_t)npf*n_embd,0.f); int pos=0;
+                    for(int i=0;i<3;i++){memcpy(&pe[pos*n_embd],&tproj[i*n_embd],n_embd*sizeof(float));pos++;}
+                    for(int i=0;i<ncp-2;i++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[i][j];pos++;}
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_bos_embed[j]+pe_emb[ncp-2][j];pos++;
+                    for(int i=0;i<n_text_content;i++){for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tproj[(3+i)*n_embd+j]+cpad[j];pos++;}
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_eos_embed[j]+cpad[j];pos++;
+                    for(int j=0;j<n_embd;j++)pe[pos*n_embd+j]=tts_pad_embed[j]+pe_emb[ncp-1][j];pos++;
+                }
             };
 
             struct req_t {
-                std::string text, language;
+                std::string text, language, ref_audio, ref_text;
                 tts_sampler_params tsp, csp;
                 int max_tok = 2048; uint32_t seed = 0;
                 std::promise<std::vector<float>> result;   // non-streaming: full WAV
@@ -2801,6 +2872,7 @@ int main(int argc, char ** argv) {
                     std::vector<std::vector<int32_t>> codes;
                     std::mt19937 rng;
                     int emitted_samples=0, last_voc_n=0; // streaming vocode state
+                    int icl_ref_frames=0;                // leading frames to trim (ICL clone)
                 };
                 std::vector<sslot> S(N);
                 const int SPF=1920, SV_CHUNK=12, SV_LEFT=16, SV_MARGIN=6;
@@ -2837,6 +2909,12 @@ int main(int argc, char ** argv) {
                     else {
                         std::vector<float> pcm;
                         if (voc_ready && !S[s].codes.empty()) pcm = voc_decode_audio(voc, S[s].codes, (int)S[s].codes.size());
+                        int trim = S[s].icl_ref_frames * SPF; // trim the regenerated reference prefix (ICL)
+                        if (trim > 0 && trim < (int)pcm.size()) {
+                            int cut = find_zero_crossing(pcm, trim);
+                            pcm.erase(pcm.begin(), pcm.begin() + cut);
+                            fade_in(pcm, 240);
+                        }
                         S[s].req->result.set_value(std::move(pcm));
                     }
                     release(s);
@@ -2851,8 +2929,8 @@ int main(int argc, char ** argv) {
                         std::shared_ptr<req_t> r;
                         { std::lock_guard<std::mutex> lk(qmu); if (!queue.empty()) { r = queue.front(); queue.pop_front(); } }
                         if (!r) break;
-                        std::vector<float> pe; int npf=0;
-                        build_prefill(r->text, r->language, pe, npf);
+                        std::vector<float> pe; int npf=0, icl_ref=0;
+                        build_prefill(r->text, r->language, r->ref_audio, r->ref_text, pe, npf, icl_ref);
                         llama_memory_seq_rm(tmem, s, -1, -1);
                         pf.n_tokens = npf;
                         memset(pf.pos, 0, sizeof(llama_pos)*2048*n_pos_per_embd);
@@ -2870,7 +2948,9 @@ int main(int argc, char ** argv) {
                         S[s].cb0 = tts_sample(cl.data(), n_codec_vocab, r->tsp, S[s].recent, S[s].rng);
                         S[s].recent.push_back(S[s].cb0);
                         S[s].tpos=npf; S[s].gstep=0; S[s].codes.clear(); S[s].req=r; S[s].active=true;
-                        S[s].emitted_samples=0; S[s].last_voc_n=0;
+                        S[s].icl_ref_frames=icl_ref;
+                        // Skip the regenerated reference prefix from streamed output (kept as vocoder context).
+                        S[s].emitted_samples = icl_ref * SPF; S[s].last_voc_n=0;
                     }
 
                     std::vector<int> act; for (int s=0;s<N;s++) if (S[s].active) act.push_back(s);
@@ -2943,6 +3023,7 @@ int main(int argc, char ** argv) {
                 try { j = nlohmann::json::parse(req.body); } catch(...) { res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
                 auto r = std::make_shared<req_t>();
                 r->text = jstr(j,"input",""); r->language = jstr(j,"language","english");
+                r->ref_audio = jstr(j,"ref_audio",""); r->ref_text = jstr(j,"ref_text","");
                 r->tsp = talker_sparams; r->csp = cp_sparams;
                 if (j.contains("temperature")&&j["temperature"].is_number()) r->tsp.temp=j["temperature"].get<float>();
                 if (j.contains("top_k")&&j["top_k"].is_number()) r->tsp.top_k=j["top_k"].get<int>();
