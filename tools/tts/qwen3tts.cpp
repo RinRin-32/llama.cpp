@@ -2865,6 +2865,8 @@ int main(int argc, char ** argv) {
             };
             auto build_prefill = [&](const std::string & rtext, const std::string & rlang,
                                      const std::string & raudio, const std::string & rreftext,
+                                     const std::vector<float> & spk_in,
+                                     const std::vector<std::vector<int32_t>> & refc_in,
                                      std::vector<float> & pe, int & npf, int & icl_ref) {
                 icl_ref = 0;
                 std::vector<llama_token> toks = tok_wrap(rtext); int nt=(int)toks.size();
@@ -2874,16 +2876,19 @@ int main(int argc, char ** argv) {
                 auto it = LANGUAGE_IDS.find(ll);
                 uint32_t lang_id = (it != LANGUAGE_IDS.end()) ? it->second : LANGUAGE_IDS.at("english");
 
-                bool has_spk = !raudio.empty();
-                std::vector<float> spk_emb; std::vector<std::vector<int32_t>> ref_frames;
-                if (has_spk) {
+                // Use precomputed embedding/codes if given (cacheable per voice); else extract from ref audio.
+                std::vector<float> spk_emb = spk_in;
+                std::vector<std::vector<int32_t>> ref_frames = refc_in;
+                bool need_read = !raudio.empty() && (spk_emb.empty() || (!rreftext.empty() && ref_frames.empty()));
+                if (need_read) {
                     std::vector<float> samp;
                     if (read_wav(raudio.c_str(), samp)) {
-                        spk_emb = extract_spk(samp);
-                        if (!rreftext.empty() && enc_ok) enc_encode_audio(enc_m, samp.data(), (int)samp.size(), 16, ref_frames);
+                        if (spk_emb.empty()) spk_emb = extract_spk(samp);
+                        if (!rreftext.empty() && ref_frames.empty() && enc_ok)
+                            enc_encode_audio(enc_m, samp.data(), (int)samp.size(), 16, ref_frames);
                     }
-                    if (spk_emb.empty()) has_spk = false;
                 }
+                bool has_spk = !spk_emb.empty();
                 bool icl = has_spk && !rreftext.empty() && !ref_frames.empty();
 
                 std::vector<uint32_t> pre = (lang_id!=0)
@@ -2932,6 +2937,8 @@ int main(int argc, char ** argv) {
 
             struct req_t {
                 std::string text, language, ref_audio, ref_text;
+                std::vector<float> spk_in;                       // precomputed x-vector (optional)
+                std::vector<std::vector<int32_t>> refc_in;       // precomputed ref codes (optional)
                 tts_sampler_params tsp, csp;
                 int max_tok = 2048; uint32_t seed = 0;
                 std::promise<std::vector<float>> result;   // non-streaming: full WAV
@@ -3018,7 +3025,7 @@ int main(int argc, char ** argv) {
                         { std::lock_guard<std::mutex> lk(qmu); if (!queue.empty()) { r = queue.front(); queue.pop_front(); } }
                         if (!r) break;
                         std::vector<float> pe; int npf=0, icl_ref=0;
-                        build_prefill(r->text, r->language, r->ref_audio, r->ref_text, pe, npf, icl_ref);
+                        build_prefill(r->text, r->language, r->ref_audio, r->ref_text, r->spk_in, r->refc_in, pe, npf, icl_ref);
                         llama_memory_seq_rm(tmem, s, -1, -1);
                         pf.n_tokens = npf;
                         memset(pf.pos, 0, sizeof(llama_pos)*2048*n_pos_per_embd);
@@ -3129,6 +3136,10 @@ int main(int argc, char ** argv) {
                 auto r = std::make_shared<req_t>();
                 r->text = jstr(j,"input",""); r->language = jstr(j,"language","english");
                 r->ref_audio = jstr(j,"ref_audio",""); r->ref_text = jstr(j,"ref_text","");
+                if (j.contains("spk_embedding") && j["spk_embedding"].is_array())
+                    for (auto & v : j["spk_embedding"]) r->spk_in.push_back(v.get<float>());
+                if (j.contains("ref_codes") && j["ref_codes"].is_array())
+                    for (auto & frame : j["ref_codes"]) { std::vector<int32_t> f; if (frame.is_array()) for (auto & c : frame) f.push_back(c.get<int>()); if (!f.empty()) r->refc_in.push_back(std::move(f)); }
                 r->tsp = talker_sparams; r->csp = cp_sparams;
                 if (j.contains("temperature")&&j["temperature"].is_number()) r->tsp.temp=j["temperature"].get<float>();
                 if (j.contains("top_k")&&j["top_k"].is_number()) r->tsp.top_k=j["top_k"].get<int>();
@@ -3167,7 +3178,24 @@ int main(int argc, char ** argv) {
                     res.set_content(wav, "audio/wav");
                 }
             });
-            printf("[serve] HTTP server on 0.0.0.0:%d (slots=%d): POST /v1/audio/speech | GET /health /v1/models\n", serve_port, N);
+            // Precompute a voice's x-vector (+ ICL ref codes) for caching in a DB. Runs on the
+            // request thread (CPU encoders, independent of the scheduler's llama contexts).
+            svr.Post("/v1/audio/encode",[&](const httplib::Request&req,httplib::Response&res){
+                nlohmann::json j;
+                try { j = nlohmann::json::parse(req.body); } catch(...) { res.status=400; res.set_content("{\"error\":\"bad json\"}","application/json"); return; }
+                std::string raudio = jstr(j,"ref_audio","");
+                if (raudio.empty()){ res.status=400; res.set_content("{\"error\":\"ref_audio required\"}","application/json"); return; }
+                bool with_codes = !(j.contains("with_codes") && j["with_codes"].is_boolean() && !j["with_codes"].get<bool>()); // default true
+                std::vector<float> samp;
+                if (!read_wav(raudio.c_str(), samp)){ res.status=400; res.set_content("{\"error\":\"cannot read ref_audio\"}","application/json"); return; }
+                std::vector<float> spk = extract_spk(samp);
+                std::vector<std::vector<int32_t>> frames;
+                if (with_codes && enc_ok) enc_encode_audio(enc_m, samp.data(), (int)samp.size(), 16, frames);
+                nlohmann::json out; out["spk_embedding"] = spk; out["embedding_dim"] = (int)spk.size();
+                if (!frames.empty()) { out["ref_codes"] = frames; out["ref_frames"] = (int)frames.size(); }
+                res.set_content(out.dump(), "application/json");
+            });
+            printf("[serve] HTTP server on 0.0.0.0:%d (slots=%d): POST /v1/audio/speech, /v1/audio/encode | GET /health /v1/models\n", serve_port, N);
             svr.listen("0.0.0.0", serve_port);
             running=false; qcv.notify_all(); sched.join();
             llama_batch_free(batch);
