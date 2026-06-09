@@ -1592,10 +1592,15 @@ static std::vector<float> voc_decode_audio_range(const voc_model & voc,
     // every call was the dominant cost (turning ~RT decode into ~0.2x). The allocator grows its
     // buffer to the largest window seen and reuses it. Only the small graph-metadata context is
     // built per call (no_alloc=true => no tensor data here, so a modest arena suffices).
-    static ggml_backend_t backend = nullptr;
-    static ggml_gallocr_t alloc   = nullptr;
+    // thread_local so a pool of vocode workers can each decode concurrently on its own backend
+    // (the scheduler thread keeps its own too, used for streaming chunks). Per-backend thread
+    // count is capped via QWEN_VOC_THREADS so K workers x T threads doesn't oversubscribe cores.
+    thread_local static ggml_backend_t backend = nullptr;
+    thread_local static ggml_gallocr_t alloc   = nullptr;
     if (!backend) {
         backend = ggml_backend_cpu_init();
+        const char * vt = getenv("QWEN_VOC_THREADS");
+        if (vt) ggml_backend_cpu_set_n_threads(backend, std::max(1, atoi(vt)));
         alloc   = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
 
@@ -1667,6 +1672,17 @@ struct gpu_gemm {
     std::vector<spec> specs;
     std::vector<ggml_tensor*> w;
 
+    // Embedding tables for fused on-GPU gather (lever b): codec_embd + the 15 CP
+    // codec_embd tables. Resident f32 on the GPU; gather_proj / gather_sum_pad run
+    // ggml_get_rows directly (and fuse the small_to_mtp projection) so the per-frame
+    // codec-embedding lookups stop hitting the CPU.
+    struct espec { int ne0, ne1; const ggml_tensor * src; };
+    std::vector<espec> especs;
+    std::vector<ggml_tensor*> etab;
+    int s2m_w = -1;                 // index into w[] of small_to_mtp, or -1 => identity
+    std::vector<float> pad_host;    // tts_pad embedding (added in gather_sum_pad)
+    ggml_tensor * pad_t = nullptr;  // [n_embd] on GPU
+
     bool ok() const { return be != nullptr; }
     bool init() {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -1677,16 +1693,28 @@ struct gpu_gemm {
         return true;
     }
     int add(const ggml_tensor * src) { specs.push_back({(int)src->ne[0], (int)src->ne[1], src}); return (int)specs.size()-1; }
+    int add_table(const ggml_tensor * src) { especs.push_back({(int)src->ne[0], (int)src->ne[1], src}); return (int)especs.size()-1; }
+    void set_s2m_w(int idx) { s2m_w = idx; }
+    void set_pad(const float * p, int n) { pad_host.assign(p, p+n); }
     bool finalize() {
         if (!be) return false;
-        wctx = ggml_init({ specs.size()*ggml_tensor_overhead() + 4096, nullptr, true });
-        for (auto & s : specs) w.push_back(ggml_new_tensor_2d(wctx, GGML_TYPE_F32, s.in, s.out));
+        size_t ntens = specs.size() + especs.size() + (pad_host.empty()?0:1);
+        wctx = ggml_init({ ntens*ggml_tensor_overhead() + 4096, nullptr, true });
+        for (auto & s : specs)  w.push_back(ggml_new_tensor_2d(wctx, GGML_TYPE_F32, s.in, s.out));
+        for (auto & e : especs) etab.push_back(ggml_new_tensor_2d(wctx, GGML_TYPE_F32, e.ne0, e.ne1));
+        if (!pad_host.empty()) pad_t = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, (int)pad_host.size());
         if (!ggml_backend_alloc_ctx_tensors(wctx, be)) return false;
         for (size_t i=0;i<specs.size();i++) {
             std::vector<float> buf((size_t)specs[i].in * specs[i].out);
             dequant_to_f32(specs[i].src, buf.data());
             ggml_backend_tensor_set(w[i], buf.data(), 0, buf.size()*sizeof(float));
         }
+        for (size_t i=0;i<especs.size();i++) {
+            std::vector<float> buf((size_t)especs[i].ne0 * especs[i].ne1);
+            dequant_to_f32(especs[i].src, buf.data());
+            ggml_backend_tensor_set(etab[i], buf.data(), 0, buf.size()*sizeof(float));
+        }
+        if (pad_t) ggml_backend_tensor_set(pad_t, pad_host.data(), 0, pad_host.size()*sizeof(float));
         return true;
     }
     // x: [in_dim, N] row-major (slot-major: x[n*in + i]); out: [out_dim, N] (out[n*out + o]).
@@ -1701,6 +1729,45 @@ struct gpu_gemm {
         ggml_backend_graph_compute(be, gf);
         out.resize((size_t)o*N);
         ggml_backend_tensor_get(Y, out.data(), 0, out.size()*sizeof(float));
+        ggml_free(c);
+    }
+
+    // Gather one row per slot from embedding table tidx (ids[k] = token for slot k),
+    // optionally project through small_to_mtp. out is slot-major: out[k*out_dim + o].
+    void gather_proj(int tidx, const int32_t * ids, int N, std::vector<float> & out) {
+        ggml_context * c = ggml_init({ ggml_tensor_overhead()*8 + ggml_graph_overhead() + 4096, nullptr, true });
+        ggml_tensor * I = ggml_new_tensor_1d(c, GGML_TYPE_I32, N);
+        ggml_tensor * R = ggml_get_rows(c, etab[tidx], I);              // [n_embd, N]
+        ggml_tensor * Y = (s2m_w>=0) ? ggml_mul_mat(c, w[s2m_w], R) : R; // [n_embd_cp, N]
+        ggml_cgraph * gf = ggml_new_graph(c); ggml_build_forward_expand(gf, Y);
+        ggml_gallocr_alloc_graph(alloc, gf);
+        ggml_backend_tensor_set(I, ids, 0, (size_t)N*sizeof(int32_t));
+        ggml_backend_graph_compute(be, gf);
+        int o = (int)Y->ne[0];
+        out.resize((size_t)o*N);
+        ggml_backend_tensor_get(Y, out.data(), 0, out.size()*sizeof(float));
+        ggml_free(c);
+    }
+
+    // Summed-frame talker embedding: for slot k, out[:,k] = pad + sum_c get_rows(table[tidxs[c]], ids[c*N+k]).
+    // ids is laid out [ncb][N]. out is slot-major: out[k*n_embd + o]. No projection (talker dim).
+    void gather_sum_pad(const int * tidxs, int ncb, const int32_t * ids, int N, std::vector<float> & out) {
+        ggml_context * c = ggml_init({ ggml_tensor_overhead()*(size_t)(ncb*2+8) + ggml_graph_overhead() + 4096, nullptr, true });
+        ggml_tensor * acc = nullptr;
+        std::vector<ggml_tensor*> Is(ncb);
+        for (int j=0;j<ncb;j++) {
+            Is[j] = ggml_new_tensor_1d(c, GGML_TYPE_I32, N);
+            ggml_tensor * R = ggml_get_rows(c, etab[tidxs[j]], Is[j]);
+            acc = acc ? ggml_add(c, acc, R) : R;
+        }
+        if (pad_t) acc = ggml_add(c, acc, ggml_reshape_2d(c, pad_t, pad_t->ne[0], 1));
+        ggml_cgraph * gf = ggml_new_graph(c); ggml_build_forward_expand(gf, acc);
+        ggml_gallocr_alloc_graph(alloc, gf);
+        for (int j=0;j<ncb;j++) ggml_backend_tensor_set(Is[j], ids + (size_t)j*N, 0, (size_t)N*sizeof(int32_t));
+        ggml_backend_graph_compute(be, gf);
+        int o = (int)acc->ne[0];
+        out.resize((size_t)o*N);
+        ggml_backend_tensor_get(acc, out.data(), 0, out.size()*sizeof(float));
         ggml_free(c);
     }
 };
@@ -2829,16 +2896,29 @@ int main(int argc, char ** argv) {
             // CPU dot loops to batched GPU GEMMs. Falls back to CPU if no GPU backend.
             gpu_gemm gg; bool gg_ok = gg.init();
             int GG_HEAD=-1, GG_S2M=-1; std::vector<int> GG_CPLM(n_codebooks,-1);
+            // Embedding-table indices for the fused on-GPU gather (lever b).
+            int GE_TALK=-1; std::vector<int> GE_CP(n_codebooks,-1);
             if (gg_ok) {
                 GG_HEAD = gg.add(w_codec_head);
                 for (int i=0;i<n_codebooks;i++) GG_CPLM[i] = gg.add(cp_lm_heads[i]);
                 if (w_cp_s2m) GG_S2M = gg.add(w_cp_s2m);
+                // codec_embd + 15 CP codec_embd tables, resident on GPU for get_rows.
+                GE_TALK = gg.add_table(w_codec_embd);
+                for (int i=0;i<n_codebooks;i++) GE_CP[i] = gg.add_table(cp_codec_embds[i]);
+                gg.set_s2m_w(GG_S2M);
+                gg.set_pad(tts_pad_embed, n_embd);
                 gg_ok = gg.finalize();
             }
             std::vector<float> s2m_bias;
             if (b_cp_s2m) { s2m_bias.resize((size_t)ggml_nelements(b_cp_s2m)); dequant_to_f32(b_cp_s2m, s2m_bias.data()); }
-            printf("[serve] gpu head matmuls: %s  (projection %s)\n",
-                   gg_ok ? "on" : "off (CPU fallback)", (gg_ok && GG_S2M>=0) ? "gpu" : (w_cp_s2m ? "cpu" : "identity"));
+            // GPU gather is used only when it fuses with a real s2m projection (1.7B-style); on
+            // 0.6B (identity s2m) the single-row CPU gather is cheaper than a GPU round-trip. The
+            // summed talker frame (16 gathers) always goes to GPU when available -- see Op C.
+            bool ge_proj = gg_ok && GG_S2M>=0;
+            printf("[serve] gpu head matmuls: %s  (projection %s, embed-gather %s)\n",
+                   gg_ok ? "on" : "off (CPU fallback)",
+                   (gg_ok && GG_S2M>=0) ? "gpu" : (w_cp_s2m ? "cpu" : "identity"),
+                   gg_ok ? "gpu" : "cpu");
 
             // Project a batch of n_embd inputs [n_embd, na] -> [n_embd_cp, na] (small_to_mtp + bias).
             auto proj_batch = [&](const std::vector<float> & in, int na_, std::vector<float> & out) {
@@ -2959,6 +3039,42 @@ int main(int argc, char ** argv) {
             std::mutex qmu; std::condition_variable qcv;
             std::atomic<bool> running{true};
 
+            // Off-thread vocode pool. Non-streaming finalize hands the finished codes to a worker
+            // and frees the slot immediately, so the scheduler keeps generating for other slots
+            // instead of blocking ~1.4s/clip on the CPU vocoder (measured ~83% of scheduler time).
+            // Each worker decodes on its own thread_local vocoder backend -> K clips vocode in
+            // parallel across cores. Tune with QWEN_VOC_WORKERS / QWEN_VOC_THREADS.
+            struct voc_job { std::shared_ptr<req_t> req; std::vector<std::vector<int32_t>> codes; int icl_ref; };
+            std::deque<std::shared_ptr<voc_job>> vq; std::mutex vqm; std::condition_variable vqcv;
+            const int SPF_VOC = 1920;
+            int n_voc_workers = 6;
+            if (const char* e=getenv("QWEN_VOC_WORKERS")) n_voc_workers = std::max(1, atoi(e));
+            if (!getenv("QWEN_VOC_THREADS")) {
+                unsigned hw = std::thread::hardware_concurrency(); if (!hw) hw = 8;
+                char b[16]; snprintf(b, sizeof(b), "%d", std::max(1u, hw / (unsigned)n_voc_workers));
+                setenv("QWEN_VOC_THREADS", b, 1);
+            }
+            printf("[serve] vocode pool: %d workers x %s threads\n", n_voc_workers, getenv("QWEN_VOC_THREADS"));
+            std::vector<std::thread> vworkers;
+            for (int w=0; w<n_voc_workers; w++) vworkers.emplace_back([&](){
+                while (running) {
+                    std::shared_ptr<voc_job> j;
+                    { std::unique_lock<std::mutex> lk(vqm);
+                      vqcv.wait(lk, [&]{ return !vq.empty() || !running; });
+                      if (!vq.empty()) { j = vq.front(); vq.pop_front(); } }
+                    if (!j) continue;
+                    std::vector<float> pcm;
+                    if (voc_ready && !j->codes.empty()) pcm = voc_decode_audio(voc, j->codes, (int)j->codes.size());
+                    int trim = j->icl_ref * SPF_VOC; // trim the regenerated ICL reference prefix
+                    if (trim > 0 && trim < (int)pcm.size()) {
+                        int cut = find_zero_crossing(pcm, trim);
+                        pcm.erase(pcm.begin(), pcm.begin() + cut);
+                        fade_in(pcm, 240);
+                    }
+                    j->req->result.set_value(std::move(pcm));
+                }
+            });
+
             std::thread sched([&]() {
                 struct sslot {
                     bool active=false; std::shared_ptr<req_t> req;
@@ -2970,6 +3086,11 @@ int main(int argc, char ** argv) {
                     int icl_ref_frames=0;                // leading frames to trim (ICL clone)
                 };
                 std::vector<sslot> S(N);
+                // --- per-stage profiling (env QWEN_PROFILE), single scheduler thread so plain doubles are safe ---
+                const bool PROF = getenv("QWEN_PROFILE")!=nullptr;
+                struct { double dec=0, aux=0, read=0, samp=0, voc=0, frame=0, finvoc=0, prefill=0; long frames=0, iters=0; } P;
+                auto CLK=[](){ return std::chrono::steady_clock::now(); };
+                auto EL =[&](std::chrono::steady_clock::time_point t){ return std::chrono::duration<double,std::milli>(CLK()-t).count(); };
                 const int SPF=1920, SV_CHUNK=12, SV_LEFT=16, SV_MARGIN=6;
                 // Emit any newly-safe streaming audio for slot s (windowed vocode, emit-once).
                 auto stream_emit = [&](int s, bool flush){
@@ -3002,15 +3123,11 @@ int main(int argc, char ** argv) {
                 auto finalize = [&](int s){
                     if (S[s].req->stream) { stream_emit(s, true); S[s].req->finish_stream(); }
                     else {
-                        std::vector<float> pcm;
-                        if (voc_ready && !S[s].codes.empty()) pcm = voc_decode_audio(voc, S[s].codes, (int)S[s].codes.size());
-                        int trim = S[s].icl_ref_frames * SPF; // trim the regenerated reference prefix (ICL)
-                        if (trim > 0 && trim < (int)pcm.size()) {
-                            int cut = find_zero_crossing(pcm, trim);
-                            pcm.erase(pcm.begin(), pcm.begin() + cut);
-                            fade_in(pcm, 240);
-                        }
-                        S[s].req->result.set_value(std::move(pcm));
+                        // Hand the finished codes to the vocode pool and free the slot now; a worker
+                        // vocodes + trims off-thread and fulfills the request's promise.
+                        auto j = std::make_shared<voc_job>();
+                        j->req = S[s].req; j->codes = std::move(S[s].codes); j->icl_ref = S[s].icl_ref_frames;
+                        { std::lock_guard<std::mutex> lk(vqm); vq.push_back(std::move(j)); } vqcv.notify_one();
                     }
                     release(s);
                 };
@@ -3024,6 +3141,7 @@ int main(int argc, char ** argv) {
                         std::shared_ptr<req_t> r;
                         { std::lock_guard<std::mutex> lk(qmu); if (!queue.empty()) { r = queue.front(); queue.pop_front(); } }
                         if (!r) break;
+                        auto _pf=CLK();
                         std::vector<float> pe; int npf=0, icl_ref=0;
                         build_prefill(r->text, r->language, r->ref_audio, r->ref_text, r->spk_in, r->refc_in, pe, npf, icl_ref);
                         llama_memory_seq_rm(tmem, s, -1, -1);
@@ -3046,6 +3164,7 @@ int main(int argc, char ** argv) {
                         S[s].icl_ref_frames=icl_ref;
                         // Skip the regenerated reference prefix from streamed output (kept as vocoder context).
                         S[s].emitted_samples = icl_ref * SPF; S[s].last_voc_n=0;
+                        P.prefill+=EL(_pf);
                     }
 
                     std::vector<int> act; for (int s=0;s<N;s++) if (S[s].active) act.push_back(s);
@@ -3063,65 +3182,100 @@ int main(int argc, char ** argv) {
                     }
                     if (st.empty()) continue;
                     int na = (int)st.size();
+                    auto _fr = CLK();
 
                     // Batched code predictor (frame-synchronized across slots).
                     std::vector<std::vector<int32_t>> fc(N, std::vector<int32_t>(16,0));
                     for (int s : st){ fc[s][0]=S[s].cb0; cprec[s].clear(); llama_memory_seq_rm(cmem,s,-1,-1); }
                     cpb.n_tokens = 2*na;
-                    { std::vector<float> Hh((size_t)n_embd*na), E0((size_t)n_embd*na), thP, e0P;
-                      for (int k=0;k<na;k++){ int s=st[k];
-                          memcpy(&Hh[(size_t)k*n_embd], S[s].hidden.data(), n_embd*sizeof(float));
-                          std::vector<float> e=codec_embed(S[s].cb0); memcpy(&E0[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
-                      proj_batch(Hh, na, thP); proj_batch(E0, na, e0P);
+                    { std::vector<float> Hh((size_t)n_embd*na), thP, e0P;
+                      for (int k=0;k<na;k++) memcpy(&Hh[(size_t)k*n_embd], S[st[k]].hidden.data(), n_embd*sizeof(float));
+                      auto _a=CLK();
+                      proj_batch(Hh, na, thP);
+                      if (ge_proj) { std::vector<int32_t> ids(na); for(int k=0;k<na;k++) ids[k]=S[st[k]].cb0;
+                          gg.gather_proj(GE_TALK, ids.data(), na, e0P);
+                          if (!s2m_bias.empty()) for(int k=0;k<na;k++) for(int o=0;o<n_embd_cp;o++) e0P[(size_t)k*n_embd_cp+o]+=s2m_bias[o]; }
+                      else { std::vector<float> E0((size_t)n_embd*na);
+                          for (int k=0;k<na;k++){ std::vector<float> e=codec_embed(S[st[k]].cb0); memcpy(&E0[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
+                          proj_batch(E0, na, e0P); }
+                      P.aux+=EL(_a);
                       for (int k=0;k<na;k++){ int s=st[k];
                           memcpy(cpb.embd+(2*k)*n_embd_cp,   &thP[(size_t)k*n_embd_cp], n_embd_cp*sizeof(float));
                           memcpy(cpb.embd+(2*k+1)*n_embd_cp, &e0P[(size_t)k*n_embd_cp], n_embd_cp*sizeof(float));
                           cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
                           cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; } }
-                    if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) fail(s); continue; }
+                    { auto _d=CLK(); int rc=llama_decode(cp_ctx,cpb); P.dec+=EL(_d); if (rc!=0){ for(int s:st) fail(s); continue; } }
                     // CP step 0 logits: batched GPU GEMM (cp lm_head[0]) across slots, else CPU.
                     { std::vector<float> H((size_t)n_embd_cp*na), L;
-                      for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,2*k+1), n_embd_cp*sizeof(float));
-                      if (gg_ok) gg.run(GG_CPLM[0], H.data(), na, L);
+                      auto _r=CLK(); for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,2*k+1), n_embd_cp*sizeof(float)); P.read+=EL(_r);
+                      auto _a=CLK(); if (gg_ok) gg.run(GG_CPLM[0], H.data(), na, L); P.aux+=EL(_a);
+                      auto _s=CLK();
                       for (int k=0;k<na;k++){ int s=st[k]; std::vector<float> buf; float* lg;
                           if (gg_ok) lg=&L[(size_t)k*cp_vocab]; else { cp_compute_logits(0,&H[(size_t)k*n_embd_cp],buf); lg=buf.data(); }
-                          fc[s][1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); } }
+                          fc[s][1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); }
+                      P.samp+=EL(_s); }
                     for (int cb_step=1; cb_step<n_codebooks; cb_step++){
                         cpb.n_tokens=na;
-                        { std::vector<float> Se((size_t)n_embd*na), seP;
-                          for(int k=0;k<na;k++){int s=st[k]; std::vector<float> e=cp_codec_embed(cb_step-1,fc[s][cb_step]); memcpy(&Se[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
-                          proj_batch(Se, na, seP);
+                        { std::vector<float> seP; auto _a=CLK();
+                          if (ge_proj) { std::vector<int32_t> ids(na); for(int k=0;k<na;k++) ids[k]=fc[st[k]][cb_step];
+                              gg.gather_proj(GE_CP[cb_step-1], ids.data(), na, seP);
+                              if (!s2m_bias.empty()) for(int k=0;k<na;k++) for(int o=0;o<n_embd_cp;o++) seP[(size_t)k*n_embd_cp+o]+=s2m_bias[o]; }
+                          else { std::vector<float> Se((size_t)n_embd*na);
+                              for(int k=0;k<na;k++){ std::vector<float> e=cp_codec_embed(cb_step-1,fc[st[k]][cb_step]); memcpy(&Se[(size_t)k*n_embd], e.data(), n_embd*sizeof(float)); }
+                              proj_batch(Se, na, seP); }
+                          P.aux+=EL(_a);
                           for(int k=0;k<na;k++){int s=st[k]; memcpy(cpb.embd+k*n_embd_cp,&seP[(size_t)k*n_embd_cp],n_embd_cp*sizeof(float)); cpb.pos[k]=2+(cb_step-1); cpb.n_seq_id[k]=1; cpb.seq_id[k][0]=s; cpb.logits[k]=1;} }
-                        if (llama_decode(cp_ctx,cpb)!=0) break;
+                        { auto _d=CLK(); int rc=llama_decode(cp_ctx,cpb); P.dec+=EL(_d); if (rc!=0) break; }
                         std::vector<float> H((size_t)n_embd_cp*na), L;
-                        for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,k), n_embd_cp*sizeof(float));
-                        if (gg_ok) gg.run(GG_CPLM[cb_step], H.data(), na, L);
+                        auto _r=CLK(); for (int k=0;k<na;k++) memcpy(&H[(size_t)k*n_embd_cp], llama_get_embeddings_ith(cp_ctx,k), n_embd_cp*sizeof(float)); P.read+=EL(_r);
+                        auto _a2=CLK(); if (gg_ok) gg.run(GG_CPLM[cb_step], H.data(), na, L); P.aux+=EL(_a2);
+                        auto _s=CLK();
                         for(int k=0;k<na;k++){int s=st[k]; std::vector<float> buf; float* lg;
                             if (gg_ok) lg=&L[(size_t)k*cp_vocab]; else { cp_compute_logits(cb_step,&H[(size_t)k*n_embd_cp],buf); lg=buf.data(); }
                             fc[s][cb_step+1]=tts_sample(lg,cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][cb_step+1]); }
+                        P.samp+=EL(_s);
                     }
                     for (int s:st) S[s].codes.push_back(fc[s]);
-                    for (int s:st) if (S[s].req->stream) stream_emit(s, false); // push incremental PCM
+                    { auto _v=CLK(); for (int s:st) if (S[s].req->stream) stream_emit(s, false); P.voc+=EL(_v); } // push incremental PCM
 
-                    // Batched talker step (one summed-frame embedding per slot).
+                    // Batched talker step (one summed-frame embedding per slot). The 16 codec
+                    // embedding gathers + sum + tts_pad run as one fused GPU op when available.
                     tb.n_tokens=na; memset(tb.pos,0,sizeof(llama_pos)*N*n_pos_per_embd);
+                    std::vector<float> NE;
+                    if (gg_ok) {
+                        std::vector<int32_t> ids((size_t)16*na);
+                        for (int k=0;k<na;k++){ int s=st[k]; ids[k]=fc[s][0];
+                            for(int cbi=0;cbi<n_codebooks;cbi++) ids[(size_t)(cbi+1)*na+k]=fc[s][cbi+1]; }
+                        int tidxs[16]; tidxs[0]=GE_TALK; for(int i=0;i<n_codebooks;i++) tidxs[i+1]=GE_CP[i];
+                        auto _a=CLK(); gg.gather_sum_pad(tidxs, 16, ids.data(), na, NE); P.aux+=EL(_a); // includes + tts_pad
+                    }
                     for (int k=0;k<na;k++){ int s=st[k];
-                        std::vector<float> ne(n_embd,0.f); std::vector<float> e0=codec_embed(fc[s][0]);
-                        for(int j=0;j<n_embd;j++)ne[j]+=e0[j];
-                        for(int cbi=0;cbi<n_codebooks;cbi++){std::vector<float> ec=cp_codec_embed(cbi,fc[s][cbi+1]); for(int j=0;j<n_embd;j++)ne[j]+=ec[j];}
-                        for(int j=0;j<n_embd;j++)ne[j]+=tts_pad_embed[j];
-                        memcpy(tb.embd+k*n_embd,ne.data(),n_embd*sizeof(float));
+                        if (gg_ok) memcpy(tb.embd+k*n_embd, &NE[(size_t)k*n_embd], n_embd*sizeof(float));
+                        else { std::vector<float> ne(n_embd,0.f); std::vector<float> e0=codec_embed(fc[s][0]);
+                            for(int j=0;j<n_embd;j++)ne[j]+=e0[j];
+                            for(int cbi=0;cbi<n_codebooks;cbi++){std::vector<float> ec=cp_codec_embed(cbi,fc[s][cbi+1]); for(int j=0;j<n_embd;j++)ne[j]+=ec[j];}
+                            for(int j=0;j<n_embd;j++)ne[j]+=tts_pad_embed[j];
+                            memcpy(tb.embd+k*n_embd,ne.data(),n_embd*sizeof(float)); }
                         for(int d=0;d<3;d++)tb.pos[d*na+k]=S[s].tpos; tb.pos[3*na+k]=0;
                         tb.n_seq_id[k]=1; tb.seq_id[k][0]=s; tb.logits[k]=1; }
-                    if (llama_decode(talker_ctx,tb)!=0){ for(int s:st) fail(s); continue; }
+                    { auto _d=CLK(); int rc=llama_decode(talker_ctx,tb); P.dec+=EL(_d); if (rc!=0){ for(int s:st) fail(s); continue; } }
                     // Talker cb0 logits: batched GPU GEMM (codec_head) across slots, else CPU.
                     { std::vector<float> Hh((size_t)n_embd*na), L;
-                      for (int k=0;k<na;k++){ const float* h=llama_get_embeddings_ith(talker_ctx,k); S[st[k]].hidden.assign(h,h+n_embd); memcpy(&Hh[(size_t)k*n_embd],h,n_embd*sizeof(float)); }
-                      if (gg_ok) gg.run(GG_HEAD, Hh.data(), na, L);
+                      auto _r=CLK(); for (int k=0;k<na;k++){ const float* h=llama_get_embeddings_ith(talker_ctx,k); S[st[k]].hidden.assign(h,h+n_embd); memcpy(&Hh[(size_t)k*n_embd],h,n_embd*sizeof(float)); } P.read+=EL(_r);
+                      auto _a=CLK(); if (gg_ok) gg.run(GG_HEAD, Hh.data(), na, L); P.aux+=EL(_a);
+                      auto _s=CLK();
                       for(int k=0;k<na;k++){ int s=st[k]; std::vector<float> cl; float* lg;
                           if (gg_ok) lg=&L[(size_t)k*n_codec_vocab]; else { compute_logits(&Hh[(size_t)k*n_embd],cl); lg=cl.data(); }
                           S[s].cb0=tts_sample(lg,n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
-                          S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; } }
+                          S[s].recent.push_back(S[s].cb0); S[s].tpos++; S[s].gstep++; }
+                      P.samp+=EL(_s); }
+                    P.frame+=EL(_fr); P.iters++; P.frames+=na;
+                    if (PROF && P.iters%200==0) {
+                        double t=P.frame; printf("[prof] iters=%ld frames=%ld | LOOP %.1fms/iter: dec=%.0f%% aux=%.0f%% read=%.0f%% samp=%.0f%% voc=%.0f%% other=%.0f%% | OUTSIDE-LOOP totals: prefill=%.0fms finalize_vocode=%.0fms loop=%.0fms\n",
+                            P.iters,P.frames, t/P.iters, 100*P.dec/t,100*P.aux/t,100*P.read/t,100*P.samp/t,100*P.voc/t,
+                            100*(t-P.dec-P.aux-P.read-P.samp-P.voc)/t, P.prefill, P.finvoc, P.frame);
+                        fflush(stdout);
+                    }
                 }
                 llama_batch_free(pf); llama_batch_free(tb); llama_batch_free(cpb);
             });
@@ -3197,7 +3351,8 @@ int main(int argc, char ** argv) {
             });
             printf("[serve] HTTP server on 0.0.0.0:%d (slots=%d): POST /v1/audio/speech, /v1/audio/encode | GET /health /v1/models\n", serve_port, N);
             svr.listen("0.0.0.0", serve_port);
-            running=false; qcv.notify_all(); sched.join();
+            running=false; qcv.notify_all(); vqcv.notify_all(); sched.join();
+            for (auto & w : vworkers) w.join();
             llama_batch_free(batch);
             goto cleanup;
         }
