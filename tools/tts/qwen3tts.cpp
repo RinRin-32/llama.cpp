@@ -2775,7 +2775,19 @@ int main(int argc, char ** argv) {
                 std::string text, language;
                 tts_sampler_params tsp, csp;
                 int max_tok = 2048; uint32_t seed = 0;
-                std::promise<std::vector<float>> result;
+                std::promise<std::vector<float>> result;   // non-streaming: full WAV
+                // streaming (stream=true): incremental PCM pushed as it's vocoded
+                bool stream = false;
+                std::mutex smu; std::condition_variable scv;
+                std::deque<std::vector<float>> chunks; bool sdone = false;
+                void push_chunk(std::vector<float> c) {
+                    { std::lock_guard<std::mutex> lk(smu); chunks.push_back(std::move(c)); }
+                    scv.notify_one();
+                }
+                void finish_stream() {
+                    { std::lock_guard<std::mutex> lk(smu); sdone = true; }
+                    scv.notify_one();
+                }
             };
             std::deque<std::shared_ptr<req_t>> queue;
             std::mutex qmu; std::condition_variable qcv;
@@ -2788,8 +2800,29 @@ int main(int argc, char ** argv) {
                     std::vector<int32_t> recent;
                     std::vector<std::vector<int32_t>> codes;
                     std::mt19937 rng;
+                    int emitted_samples=0, last_voc_n=0; // streaming vocode state
                 };
                 std::vector<sslot> S(N);
+                const int SPF=1920, SV_CHUNK=12, SV_LEFT=16, SV_MARGIN=6;
+                // Emit any newly-safe streaming audio for slot s (windowed vocode, emit-once).
+                auto stream_emit = [&](int s, bool flush){
+                    if (!voc_ready) return;
+                    int n_done = (int)S[s].codes.size();
+                    if (!flush && n_done - S[s].last_voc_n < SV_CHUNK) return;
+                    int safe = flush ? n_done : (n_done - SV_MARGIN);
+                    if (safe * SPF <= S[s].emitted_samples) { S[s].last_voc_n = n_done; return; }
+                    int ef = S[s].emitted_samples / SPF;
+                    int win0 = std::max(0, ef - SV_LEFT);
+                    int win_off = win0 * SPF;
+                    std::vector<float> a = voc_decode_audio_range(voc, S[s].codes, win0, n_done);
+                    int target = std::min(win_off + (int)a.size(), safe * SPF);
+                    if (target > S[s].emitted_samples) {
+                        std::vector<float> chunk(a.begin() + (S[s].emitted_samples - win_off), a.begin() + (target - win_off));
+                        S[s].req->push_chunk(std::move(chunk));
+                        S[s].emitted_samples = target;
+                    }
+                    S[s].last_voc_n = n_done;
+                };
                 llama_batch pf = llama_batch_init(2048, n_embd, N);
                 free(pf.pos); pf.pos = (llama_pos*)malloc(sizeof(llama_pos)*2048*n_pos_per_embd);
                 llama_batch tb = llama_batch_init(N, n_embd, N);
@@ -2797,7 +2830,19 @@ int main(int argc, char ** argv) {
                 llama_batch cpb = llama_batch_init(2*N, n_embd_cp, N);
                 std::vector<std::vector<int32_t>> cprec(N);
 
-                auto finish = [&](int s, std::vector<float> pcm){ S[s].req->result.set_value(std::move(pcm)); llama_memory_seq_rm(tmem,s,-1,-1); S[s].active=false; S[s].req.reset(); };
+                auto release = [&](int s){ llama_memory_seq_rm(tmem,s,-1,-1); S[s].active=false; S[s].req.reset(); };
+                // Normal completion: stream -> flush tail + done; non-stream -> full WAV via promise.
+                auto finalize = [&](int s){
+                    if (S[s].req->stream) { stream_emit(s, true); S[s].req->finish_stream(); }
+                    else {
+                        std::vector<float> pcm;
+                        if (voc_ready && !S[s].codes.empty()) pcm = voc_decode_audio(voc, S[s].codes, (int)S[s].codes.size());
+                        S[s].req->result.set_value(std::move(pcm));
+                    }
+                    release(s);
+                };
+                // Error path: deliver empty result and free the slot.
+                auto fail = [&](int s){ if (S[s].req->stream) S[s].req->finish_stream(); else S[s].req->result.set_value({}); release(s); };
 
                 while (running) {
                     // Admit waiting requests into free slots (per-request prefill).
@@ -2825,6 +2870,7 @@ int main(int argc, char ** argv) {
                         S[s].cb0 = tts_sample(cl.data(), n_codec_vocab, r->tsp, S[s].recent, S[s].rng);
                         S[s].recent.push_back(S[s].cb0);
                         S[s].tpos=npf; S[s].gstep=0; S[s].codes.clear(); S[s].req=r; S[s].active=true;
+                        S[s].emitted_samples=0; S[s].last_voc_n=0;
                     }
 
                     std::vector<int> act; for (int s=0;s<N;s++) if (S[s].active) act.push_back(s);
@@ -2837,11 +2883,8 @@ int main(int argc, char ** argv) {
                     // Finalize finished slots; collect the rest to step.
                     std::vector<int> st;
                     for (int s : act) {
-                        if (S[s].cb0 == (int)codec_eos_id || S[s].gstep >= S[s].req->max_tok) {
-                            std::vector<float> pcm;
-                            if (voc_ready && !S[s].codes.empty()) pcm = voc_decode_audio(voc, S[s].codes, (int)S[s].codes.size());
-                            finish(s, std::move(pcm));
-                        } else st.push_back(s);
+                        if (S[s].cb0 == (int)codec_eos_id || S[s].gstep >= S[s].req->max_tok) finalize(s);
+                        else st.push_back(s);
                     }
                     if (st.empty()) continue;
                     int na = (int)st.size();
@@ -2856,7 +2899,7 @@ int main(int argc, char ** argv) {
                         memcpy(cpb.embd+(2*k+1)*n_embd_cp, e0.data(), n_embd_cp*sizeof(float));
                         cpb.pos[2*k]=0; cpb.pos[2*k+1]=1; cpb.n_seq_id[2*k]=1; cpb.n_seq_id[2*k+1]=1;
                         cpb.seq_id[2*k][0]=s; cpb.seq_id[2*k+1][0]=s; cpb.logits[2*k]=0; cpb.logits[2*k+1]=1; }
-                    if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) finish(s,{}); continue; }
+                    if (llama_decode(cp_ctx,cpb)!=0){ for(int s:st) fail(s); continue; }
                     for (int k=0;k<na;k++){ int s=st[k]; std::vector<float> buf;
                         cp_compute_logits(0, llama_get_embeddings_ith(cp_ctx,2*k+1), buf);
                         fc[s][1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][1]); }
@@ -2870,6 +2913,7 @@ int main(int argc, char ** argv) {
                             fc[s][cb_step+1]=tts_sample(buf.data(),cp_vocab,S[s].req->csp,cprec[s],S[s].rng); cprec[s].push_back(fc[s][cb_step+1]); }
                     }
                     for (int s:st) S[s].codes.push_back(fc[s]);
+                    for (int s:st) if (S[s].req->stream) stream_emit(s, false); // push incremental PCM
 
                     // Batched talker step (one summed-frame embedding per slot).
                     tb.n_tokens=na; memset(tb.pos,0,sizeof(llama_pos)*N*n_pos_per_embd);
@@ -2881,7 +2925,7 @@ int main(int argc, char ** argv) {
                         memcpy(tb.embd+k*n_embd,ne.data(),n_embd*sizeof(float));
                         for(int d=0;d<3;d++)tb.pos[d*na+k]=S[s].tpos; tb.pos[3*na+k]=0;
                         tb.n_seq_id[k]=1; tb.seq_id[k][0]=s; tb.logits[k]=1; }
-                    if (llama_decode(talker_ctx,tb)!=0){ for(int s:st) finish(s,{}); continue; }
+                    if (llama_decode(talker_ctx,tb)!=0){ for(int s:st) fail(s); continue; }
                     for(int k=0;k<na;k++){ int s=st[k]; const float* h=llama_get_embeddings_ith(talker_ctx,k);
                         S[s].hidden.assign(h,h+n_embd); std::vector<float> cl; compute_logits(h,cl);
                         S[s].cb0=tts_sample(cl.data(),n_codec_vocab,S[s].req->tsp,S[s].recent,S[s].rng);
@@ -2905,13 +2949,37 @@ int main(int argc, char ** argv) {
                 if (j.contains("top_p")&&j["top_p"].is_number()) r->tsp.top_p=j["top_p"].get<float>();
                 r->max_tok = (j.contains("max_new_tokens")&&j["max_new_tokens"].is_number())?j["max_new_tokens"].get<int>():max_tokens;
                 r->seed = (j.contains("seed")&&j["seed"].is_number())?(uint32_t)j["seed"].get<long long>():(uint32_t)std::random_device{}();
+                r->stream = j.contains("stream") && j["stream"].is_boolean() && j["stream"].get<bool>();
                 if (r->text.empty()){ res.status=400; res.set_content("{\"error\":\"input required\"}","application/json"); return; }
-                auto fut = r->result.get_future();
+                std::future<std::vector<float>> fut;
+                if (!r->stream) fut = r->result.get_future(); // before enqueue, to avoid racing set_value
                 { std::lock_guard<std::mutex> lk(qmu); queue.push_back(r); } qcv.notify_one();
-                std::vector<float> pcm = fut.get();
-                std::string wav = wav_bytes(pcm.data(), (int)pcm.size(), 24000);
-                res.set_header("X-Audio-Sample-Rate","24000");
-                res.set_content(wav, "audio/wav");
+                if (r->stream) {
+                    // Chunked raw 16-bit PCM as it is vocoded (sglang-style streaming).
+                    res.set_header("X-Audio-Sample-Rate","24000");
+                    res.set_header("X-Audio-Channels","1");
+                    res.set_header("X-Audio-Codec","pcm_s16le");
+                    res.set_chunked_content_provider("audio/pcm",
+                        [r](size_t, httplib::DataSink & sink) -> bool {
+                            std::unique_lock<std::mutex> lk(r->smu);
+                            r->scv.wait(lk, [&]{ return !r->chunks.empty() || r->sdone; });
+                            while (!r->chunks.empty()) {
+                                std::vector<float> c = std::move(r->chunks.front()); r->chunks.pop_front();
+                                lk.unlock();
+                                std::string b; b.reserve(c.size()*2);
+                                for (float v : c) { float x=fmaxf(-1.f,fminf(1.f,v)); int16_t q=(int16_t)(x*32767.f); b.push_back((char)(q&0xff)); b.push_back((char)((q>>8)&0xff)); }
+                                if (!sink.write(b.data(), b.size())) return false;
+                                lk.lock();
+                            }
+                            if (r->sdone) { sink.done(); return false; }
+                            return true;
+                        });
+                } else {
+                    std::vector<float> pcm = fut.get();
+                    std::string wav = wav_bytes(pcm.data(), (int)pcm.size(), 24000);
+                    res.set_header("X-Audio-Sample-Rate","24000");
+                    res.set_content(wav, "audio/wav");
+                }
             });
             printf("[serve] HTTP server on 0.0.0.0:%d (slots=%d): POST /v1/audio/speech | GET /health /v1/models\n", serve_port, N);
             svr.listen("0.0.0.0", serve_port);
