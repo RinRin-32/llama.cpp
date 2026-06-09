@@ -1793,6 +1793,9 @@ int main(int argc, char ** argv) {
     int stream_chunk = 0; // >0: vocode + emit every N frames (streaming); 0: one-shot at end
     int stream_chunk_initial = 0; // >0: small first chunk for low TTFB, then ramp up to stream_chunk
     int stream_left_ctx = 32; // frames of left context re-decoded per streaming chunk (bounds cost)
+    int serve_slots = 0; // >1: enable the warm continuous-batching engine with this many slots
+    int serve_port  = 8080;
+    bool serve_http = false; // --serve: run the HTTP/WS server (vs the one-shot CLI path)
     int n_gpu = 0;
     int cp_n_gpu = -1; // code predictor GPU layers; -1 => same as talker. NOTE: CP currently
                        // produces NaN on the CPU backend (ggml CPU-backend issue in the CP graph),
@@ -1814,6 +1817,9 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
         else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--stream-left-ctx") == 0 && i + 1 < argc) stream_left_ctx = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--serve-slots") == 0 && i + 1 < argc) serve_slots = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--serve-port") == 0 && i + 1 < argc) serve_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--serve") == 0) serve_http = true;
         else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) talker_sparams.temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) talker_sparams.top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) talker_sparams.top_p = (float)atof(argv[++i]);
@@ -1842,7 +1848,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "ERROR: --model-talker and --model-cp are required\n");
         return 1;
     }
-    if (text.empty()) {
+    if (serve_http && serve_slots <= 0) serve_slots = 4; // default parallelism for the server
+    const int n_slots = std::max(1, serve_slots);
+
+    if (text.empty() && !serve_http) {
         fprintf(stderr, "ERROR: --text is required\n");
         return 1;
     }
@@ -1866,8 +1875,9 @@ int main(int argc, char ** argv) {
 
     // ── Create Talker context ──────────────────────────────────────────────
     llama_context_params talker_cparams = llama_context_default_params();
-    talker_cparams.n_ctx      = 4096;
+    talker_cparams.n_ctx      = 4096 * n_slots; // per-seq 4096; total KV across slots
     talker_cparams.n_batch    = 512;
+    talker_cparams.n_seq_max  = n_slots;
     talker_cparams.no_perf    = true;
     talker_cparams.embeddings = true;
     llama_context * talker_ctx = llama_init_from_model(talker_model, talker_cparams);
@@ -1875,8 +1885,9 @@ int main(int argc, char ** argv) {
 
     // ── Create Code Predictor context ──────────────────────────────────────
     llama_context_params cp_cparams = llama_context_default_params();
-    cp_cparams.n_ctx      = 32;
-    cp_cparams.n_batch    = 32;
+    cp_cparams.n_ctx      = 32 * n_slots; // 17 positions/frame per seq; total across slots
+    cp_cparams.n_batch    = 32 * n_slots;
+    cp_cparams.n_seq_max  = n_slots;
     cp_cparams.no_perf    = true;
     cp_cparams.embeddings = true;
     cp_cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -2686,6 +2697,150 @@ int main(int argc, char ** argv) {
                 out[i] = sum;
             }
         };
+
+        // ════════════════════════════════════════════════════════════════════
+        //  Phase 1: warm continuous-batching engine (test path).
+        //  Runs `serve_slots` copies of this request concurrently through ONE warm
+        //  model, batching the talker decode (multi-seq llama_batch) and the
+        //  code-predictor (frame-synchronized) across slots. Proves true batching
+        //  before the HTTP/WS API is layered on top.
+        // ════════════════════════════════════════════════════════════════════
+        if (serve_slots >= 1) { // >=1 so N=1 isolates batched-loop bugs from multi-seq bugs
+            const int N = serve_slots;
+            llama_memory_t talker_mem = llama_get_memory(talker_ctx);
+            llama_memory_t cp_mem     = llama_get_memory(cp_ctx);
+
+            // Replicate the prefilled seq 0 KV into the other slots (identical request).
+            for (int s = 1; s < N; s++) llama_memory_seq_cp(talker_mem, 0, s, -1, -1);
+
+            struct slot_state {
+                std::vector<float> hidden;                 // talker hidden for CP input
+                int cb0 = 0, tpos = 0, gstep = 0;
+                bool active = true;
+                std::vector<int32_t> recent;               // talker rep-penalty history
+                std::vector<std::vector<int32_t>> codes;   // [frames][16]
+                std::mt19937 rng;
+            };
+            std::vector<slot_state> S(N);
+            for (int s = 0; s < N; s++) {
+                S[s].hidden.assign(hidden, hidden + n_embd);
+                S[s].cb0   = cb0_token;
+                S[s].tpos  = n_prefill;
+                S[s].recent = { cb0_token };
+                S[s].rng   = std::mt19937((uint32_t)((seed >= 0 ? seed : 1234) + s));
+            }
+
+            llama_batch tb = llama_batch_init(N, n_embd, N);          // talker step batch
+            free(tb.pos); tb.pos = (llama_pos *)malloc(sizeof(llama_pos) * N * n_pos_per_embd);
+            llama_batch cpb = llama_batch_init(2 * N, n_embd_cp, N);  // CP batch (<=2N tokens)
+            std::vector<std::vector<int32_t>> cprec(N);               // CP rep-penalty per slot/frame
+
+            printf("\n[serve] warm batched engine: %d slots\n", N);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            int n_active = N;
+
+            while (n_active > 0) {
+                for (auto & sl : S) {
+                    if (sl.active && (sl.cb0 == (int)codec_eos_id || sl.gstep >= max_tokens)) sl.active = false;
+                }
+                std::vector<int> act;
+                for (int s = 0; s < N; s++) if (S[s].active) act.push_back(s);
+                n_active = (int)act.size();
+                if (n_active == 0) break;
+
+                std::vector<std::vector<int32_t>> fc(N, std::vector<int32_t>(16, 0));
+                for (int s : act) { fc[s][0] = S[s].cb0; cprec[s].clear(); llama_memory_seq_rm(cp_mem, s, -1, -1); }
+
+                // CP prefill: [proj(hidden), proj(codec_embed(cb0))] per slot
+                cpb.n_tokens = 2 * n_active;
+                for (int k = 0; k < n_active; k++) {
+                    int s = act[k];
+                    std::vector<float> th = project_cp(S[s].hidden);
+                    std::vector<float> e0 = project_cp(codec_embed(S[s].cb0));
+                    memcpy(cpb.embd + (2*k+0)*n_embd_cp, th.data(), n_embd_cp * sizeof(float));
+                    memcpy(cpb.embd + (2*k+1)*n_embd_cp, e0.data(), n_embd_cp * sizeof(float));
+                    cpb.pos[2*k+0] = 0; cpb.pos[2*k+1] = 1;
+                    cpb.n_seq_id[2*k+0] = 1; cpb.n_seq_id[2*k+1] = 1;
+                    cpb.seq_id[2*k+0][0] = s; cpb.seq_id[2*k+1][0] = s;
+                    cpb.logits[2*k+0] = 0; cpb.logits[2*k+1] = 1;
+                }
+                if (llama_decode(cp_ctx, cpb) != 0) { fprintf(stderr, "[serve] CP prefill failed\n"); break; }
+                for (int k = 0; k < n_active; k++) {
+                    int s = act[k];
+                    // CP prefill output is the 2nd token of slot k -> batch index 2k+1 (logits=1 there).
+                    std::vector<float> buf; cp_compute_logits(0, llama_get_embeddings_ith(cp_ctx, 2*k + 1), buf);
+                    fc[s][1] = tts_sample(buf.data(), cp_vocab, cp_sparams, cprec[s], S[s].rng);
+                    cprec[s].push_back(fc[s][1]);
+                }
+                for (int cb_step = 1; cb_step < n_codebooks; cb_step++) {
+                    cpb.n_tokens = n_active;
+                    for (int k = 0; k < n_active; k++) {
+                        int s = act[k];
+                        std::vector<float> se = project_cp(cp_codec_embed(cb_step - 1, fc[s][cb_step]));
+                        memcpy(cpb.embd + k*n_embd_cp, se.data(), n_embd_cp * sizeof(float));
+                        cpb.pos[k] = 2 + (cb_step - 1);
+                        cpb.n_seq_id[k] = 1; cpb.seq_id[k][0] = s; cpb.logits[k] = 1;
+                    }
+                    if (llama_decode(cp_ctx, cpb) != 0) { fprintf(stderr, "[serve] CP step failed\n"); break; }
+                    for (int k = 0; k < n_active; k++) {
+                        int s = act[k];
+                        std::vector<float> buf; cp_compute_logits(cb_step, llama_get_embeddings_ith(cp_ctx, k), buf);
+                        fc[s][cb_step + 1] = tts_sample(buf.data(), cp_vocab, cp_sparams, cprec[s], S[s].rng);
+                        cprec[s].push_back(fc[s][cb_step + 1]);
+                    }
+                }
+                for (int s : act) S[s].codes.push_back(fc[s]);
+
+                // Batched talker: one summed-frame embedding per active slot
+                tb.n_tokens = n_active;
+                memset(tb.pos, 0, sizeof(llama_pos) * N * n_pos_per_embd);
+                for (int k = 0; k < n_active; k++) {
+                    int s = act[k];
+                    std::vector<float> ne(n_embd, 0.0f);
+                    std::vector<float> e0 = codec_embed(fc[s][0]);
+                    for (int j = 0; j < n_embd; j++) ne[j] += e0[j];
+                    for (int cbi = 0; cbi < n_codebooks; cbi++) {
+                        std::vector<float> ec = cp_codec_embed(cbi, fc[s][cbi + 1]);
+                        for (int j = 0; j < n_embd; j++) ne[j] += ec[j];
+                    }
+                    const float * tx = (S[s].gstep < n_trailing_text)
+                        ? &trailing_text[S[s].gstep * n_embd] : pad_embed_vec.data();
+                    for (int j = 0; j < n_embd; j++) ne[j] += tx[j];
+                    memcpy(tb.embd + k*n_embd, ne.data(), n_embd * sizeof(float));
+                    for (int d = 0; d < 3; d++) tb.pos[d*n_active + k] = S[s].tpos;
+                    tb.pos[3*n_active + k] = 0;
+                    tb.n_seq_id[k] = 1; tb.seq_id[k][0] = s; tb.logits[k] = 1;
+                }
+                if (llama_decode(talker_ctx, tb) != 0) { fprintf(stderr, "[serve] talker decode failed\n"); break; }
+                for (int k = 0; k < n_active; k++) {
+                    int s = act[k];
+                    const float * h = llama_get_embeddings_ith(talker_ctx, k);
+                    S[s].hidden.assign(h, h + n_embd);
+                    std::vector<float> cl; compute_logits(h, cl);
+                    S[s].cb0 = tts_sample(cl.data(), n_codec_vocab, talker_sparams, S[s].recent, S[s].rng);
+                    S[s].recent.push_back(S[s].cb0);
+                    S[s].tpos++; S[s].gstep++;
+                }
+            }
+
+            double wall = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count() / 1000.0;
+            double tot_audio = 0;
+            std::string base = output_path.size() > 4 ? output_path.substr(0, output_path.size() - 4) : output_path;
+            for (int s = 0; s < N; s++) {
+                int nf = (int)S[s].codes.size();
+                tot_audio += nf / 12.5;
+                if (voc_ready && nf > 0) {
+                    std::vector<float> a = voc_decode_audio(voc, S[s].codes, nf);
+                    std::string outp = base + "_slot" + std::to_string(s) + ".wav";
+                    write_wav(outp.c_str(), a.data(), (int)a.size(), 24000);
+                }
+            }
+            printf("[serve] %d slots: decode wall %.2fs, total audio %.2fs, aggregate RTF %.2fx\n",
+                   N, wall, tot_audio, wall > 0 ? tot_audio / wall : 0.0);
+            llama_batch_free(tb); llama_batch_free(cpb); llama_batch_free(batch);
+            goto cleanup;
+        }
 
         // ── Autoregressive decode loop ──────────────────────────────────
         std::vector<std::vector<int32_t>> all_codes; // [n_frames, 16]
